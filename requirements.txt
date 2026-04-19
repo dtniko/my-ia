@@ -1,0 +1,9 @@
+requests>=2.31.0
+websockets>=12.0
+
+# Speaker recognition (opzionali — abilita la pipeline audio)
+resemblyzer>=0.1.4        # voice print & speaker verification
+webrtcvad>=2.0.10         # voice activity detection
+faster-whisper>=1.0.0     # STT locale (scarica il modello al primo avvio)
+numpy>=1.24.0
+scipy>=1.10.0             # resampling audio

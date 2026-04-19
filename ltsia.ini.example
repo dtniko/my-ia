@@ -1,0 +1,38 @@
+[ltsia]
+; ── LLM Thinking (qwen3-coder via Ollama) ───────────────────────────────────
+thinking_host = 192.168.250.203
+thinking_port = 11434
+thinking_model = qwen3-coder:30b
+
+; ── LLM Execution (qwen3-instruct via vLLM) ─────────────────────────────────
+exec_host = 10.149.245.212
+exec_port = 8807
+exec_model = qwen3-instruct
+
+; ── Context e limiti ─────────────────────────────────────────────────────────
+context_window = 131072
+compaction_threshold = 0.75
+max_iterations = 30
+max_test_retries = 5
+
+; ── Work directory default ────────────────────────────────────────────────────
+work_dir = /tmp/sandbox
+
+; ── Embedding (per semantic memory) ─────────────────────────────────────────
+; embedding_host = 192.168.250.203
+; embedding_port = 11434
+; embedding_model = nomic-embed-text
+
+; ── Database PostgreSQL (opzionale) ─────────────────────────────────────────
+; db_host = localhost
+; db_port = 5432
+; db_name = mydb
+; db_user = user
+; db_password = secret
+
+; ── TTS (text-to-speech via edge-tts) ────────────────────────────────────────
+; tts_enabled = false
+; tts_voice = it-IT-ElsaNeural
+
+; ── Timeout Ollama (secondi) ─────────────────────────────────────────────────
+ollama_timeout = 1800
