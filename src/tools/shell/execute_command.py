@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from typing import Callable, Optional
 from ..base_tool import BaseTool
 
@@ -91,19 +92,35 @@ class ExecuteCommandTool(BaseTool):
                 encoding="utf-8",
                 errors="replace",
             )
+
+            timed_out = {"flag": False}
+
+            def _kill_on_timeout():
+                timed_out["flag"] = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+            timer = threading.Timer(timeout, _kill_on_timeout)
+            timer.daemon = True
+            timer.start()
+
             output_lines = []
             try:
                 for line in iter(proc.stdout.readline, ""):
                     output_lines.append(line)
                     if self.output_callback:
                         self.output_callback(line)
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                output_lines.append(f"\n[TIMEOUT dopo {timeout}s]")
+                proc.wait()
+            finally:
+                timer.cancel()
+
+            if timed_out["flag"]:
+                output_lines.append(f"\n[TIMEOUT dopo {timeout}s — processo terminato]")
 
             output = "".join(output_lines)
-            exit_code = proc.returncode or 0
+            exit_code = proc.returncode if proc.returncode is not None else 0
             result = f"Exit code: {exit_code}\n{output}"
             return self.truncate(result)
         except Exception as e:

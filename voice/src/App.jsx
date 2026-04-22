@@ -5,6 +5,7 @@ import { useElevenLabs }  from './hooks/useElevenLabs.js'
 import { useAudioStream } from './hooks/useAudioStream.js'
 import { MicButton }      from './components/MicButton.jsx'
 import { ChatMessage, StreamingMessage } from './components/ChatMessage.jsx'
+import { Dashboard }      from './components/Dashboard.jsx'
 
 const DEFAULT_WS_URL = `ws://${window.location.hostname}:8765`
 
@@ -37,6 +38,15 @@ export default function App() {
 
   const [elKey,     setElKey]     = useState(() => localStorage.getItem('el_key')      ?? '')
   const [elVoiceId, setElVoiceId] = useState(() => localStorage.getItem('el_voice_id') ?? '21m00Tcm4TlvDq8ikWAM')
+
+  // ── Chat testuale ─────────────────────────────────────────────────────────
+  const [textInput, setTextInput] = useState('')
+
+  // ── Dashboard ─────────────────────────────────────────────────────────────
+  const [dashOpen,     setDashOpen]     = useState(false)
+  const [snapshot,     setSnapshot]     = useState(null)
+  const [jobsLive,     setJobsLive]     = useState(null)
+  const [jobLogsLive,  setJobLogsLive]  = useState(null)
 
   const chatEndRef    = useRef(null)
   const msgId         = useRef(0)
@@ -185,6 +195,18 @@ export default function App() {
     if (state === 'idle') setSttLive('')
   }, [])
 
+  // ── Callback dashboard ─────────────────────────────────────────────────────
+  const onSnapshot = useCallback((payload) => {
+    setSnapshot(payload)
+    if (payload?.jobs)     setJobsLive(payload.jobs)
+    if (payload?.job_logs) setJobLogsLive(payload.job_logs)
+  }, [])
+
+  const onJobsUpdate = useCallback(({ jobs, job_logs }) => {
+    setJobsLive(jobs)
+    setJobLogsLive(job_logs)
+  }, [])
+
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const ws = useWebSocket({
     onChunk, onDone, onTool, onStatus: onWsStatus, onError: onWsError,
@@ -192,6 +214,7 @@ export default function App() {
     onSpeakerStatus, onConfirmSpeaking, onEnrollNeeded,
     onEnrollStart, onEnrollProgress, onEnrollDone, onEnrollError,
     onSpeakerResult, onSttText, onSttStatus,
+    onSnapshot, onJobsUpdate,
   })
 
   const isConnected = ws.status === 'connected'
@@ -250,6 +273,7 @@ export default function App() {
 
   useEffect(() => {
     if (ws.status === 'disconnected' && appState !== 'disconnected') setAppState('disconnected')
+    if (ws.status === 'connected') ws.sendRaw({ type: 'snapshot_request' })
   }, [ws.status])
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streamText])
@@ -270,6 +294,22 @@ export default function App() {
     }
     handleMuteToggle()
   }, [appState, connect, speech, eleven, handleMuteToggle])
+
+  const handleTextSubmit = useCallback(() => {
+    const text = textInput.trim()
+    if (!text || !isConnected || appState === 'thinking') return
+    addMessage('user', text)
+    ws.sendMessage(text)
+    setTextInput('')
+    setAppState('thinking')
+  }, [textInput, isConnected, appState, addMessage, ws])
+
+  const handleTextKeyDown = useCallback((e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleTextSubmit()
+    }
+  }, [handleTextSubmit])
 
   // ── Status text ────────────────────────────────────────────────────────────
   const ttsEngine  = ttsEnabled ? (eleven.isSupported ? 'ElevenLabs' : 'Browser') : 'Off'
@@ -303,10 +343,28 @@ export default function App() {
           )}
         </div>
         <div className="header-right">
+          <button
+            className="btn-icon"
+            onClick={() => window.location.reload()}
+            title="Aggiorna web app (ricarica la pagina)"
+          >⟳</button>
+          <button
+            className={`btn-icon${dashOpen ? ' btn-icon--active' : ''}`}
+            onClick={() => setDashOpen(o => !o)}
+            title="Dashboard"
+          >⊞</button>
           {isConnected && <button className="btn-icon" onClick={disconnect} title="Disconnetti">✕</button>}
           <button className="btn-icon" onClick={() => setSettings(s => !s)} title="Impostazioni">⚙</button>
         </div>
       </header>
+
+      <Dashboard
+        open={dashOpen}
+        onClose={() => setDashOpen(false)}
+        snapshot={snapshot}
+        jobs={jobsLive}
+        jobLogs={jobLogsLive}
+      />
 
       {showSettings && (
         <div className="settings-panel">
@@ -483,6 +541,31 @@ export default function App() {
             </button>
           )}
         </div>
+
+        {isConnected && (
+          <div className="text-input-row">
+            <textarea
+              className="text-input"
+              placeholder="Scrivi un messaggio… (Invio per inviare, Shift+Invio per andare a capo)"
+              value={textInput}
+              onChange={e => setTextInput(e.target.value)}
+              onKeyDown={handleTextKeyDown}
+              rows={1}
+              disabled={appState === 'thinking' || ws.status === 'connecting'}
+            />
+            <button
+              className="text-send-btn"
+              onClick={handleTextSubmit}
+              disabled={!textInput.trim() || appState === 'thinking'}
+              title="Invia"
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+                <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+              </svg>
+            </button>
+          </div>
+        )}
+
         {!audioStream.isCapturing && isConnected && !isMuted && (
           <p className="warn-text">
             {audioStream.error ?? 'AudioWorklet non supportato — usa Chrome o Edge'}

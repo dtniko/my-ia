@@ -23,6 +23,7 @@ class ToolRegistry:
         self._tools: dict[str, BaseTool] = {}
         self._delegates: dict[str, Callable] = {}
         self._output_callback: Optional[Callable[[str], None]] = None
+        self._execution_listener: Optional[Callable[[str, dict, str], None]] = None
 
         # Carica tool built-in
         self._register_builtin_tools()
@@ -101,6 +102,13 @@ class ToolRegistry:
         except Exception:
             pass
 
+        # Tool Qdrant Viz (interfaccia web 3D per esplorare la memoria vettoriale)
+        try:
+            from .qdrant_viz.viz_tool import QdrantVizTool
+            self.register(QdrantVizTool(self.config))
+        except Exception:
+            pass
+
     def register_semantic_memory(self, semantic_memory) -> None:
         """Registra il tool search_memory (richiede SemanticMemory inizializzata)."""
         try:
@@ -147,20 +155,31 @@ class ToolRegistry:
     def set_command_output_callback(self, cb: Callable[[str], None]):
         self._output_callback = cb
 
+    def set_execution_listener(self, cb: Optional[Callable[[str, dict, str], None]]):
+        """Callback invocata dopo ogni tool.execute() con (name, args, result)."""
+        self._execution_listener = cb
+
     # ── Esecuzione ─────────────────────────────────────────────────────────────
 
     def execute(self, tool_name: str, args: dict) -> str:
         # Prima controlla i delegate
         if tool_name in self._delegates:
-            return self._delegates[tool_name](args)
-        # Poi i tool registrati
-        tool = self._tools.get(tool_name)
-        if not tool:
-            return f"ERROR: tool '{tool_name}' non trovato. Tool disponibili: {', '.join(self._tools.keys())}"
-        try:
-            return tool.execute(args)
-        except Exception as e:
-            return f"ERROR in {tool_name}: {e}"
+            result = self._delegates[tool_name](args)
+        else:
+            tool = self._tools.get(tool_name)
+            if not tool:
+                result = f"ERROR: tool '{tool_name}' non trovato. Tool disponibili: {', '.join(self._tools.keys())}"
+            else:
+                try:
+                    result = tool.execute(args)
+                except Exception as e:
+                    result = f"ERROR in {tool_name}: {e}"
+        if self._execution_listener:
+            try:
+                self._execution_listener(tool_name, args, str(result))
+            except Exception:
+                pass
+        return result
 
     # ── Schema ─────────────────────────────────────────────────────────────────
 

@@ -15,7 +15,9 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 from src.jobs.job import Job
@@ -23,9 +25,11 @@ from src.jobs.job_store import JobStore
 
 
 class JobManager:
-    def __init__(self, jobs_dir: str):
+    def __init__(self, jobs_dir: str, history_size: int = 50):
         self.store        = JobStore(jobs_dir)
         self._worker_script = self._find_worker_script()
+        self._history: deque[dict] = deque(maxlen=history_size)
+        self._history_lock = Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -70,7 +74,22 @@ class JobManager:
         return self.store.load_all()
 
     def collect_pending_outputs(self) -> list[dict]:
-        return self.store.collect_outputs()
+        outputs = self.store.collect_outputs()
+        if outputs:
+            with self._history_lock:
+                for o in outputs:
+                    self._history.append(o)
+        return outputs
+
+    def get_output_history(self, limit: int = 50) -> list[dict]:
+        """Ritorna gli output più recenti già consumati (per la dashboard).
+
+        Non modifica la pending queue: il TTS notifier continua a ricevere
+        nuovi output via collect_pending_outputs().
+        """
+        with self._history_lock:
+            items = list(self._history)
+        return items[-limit:]
 
     def restore_active_jobs(self) -> None:
         """Rilancia i worker per i job attivi (da chiamare all'avvio)."""

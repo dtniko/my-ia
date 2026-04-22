@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from src.ui.cli import CLI
+from src.ui.stream_filter import StreamFilter
 
 if TYPE_CHECKING:
     from src.agents.chat_agent import ChatAgent
@@ -25,6 +26,7 @@ Comandi disponibili:
   /new          — resetta context (nuova sessione)
   /compact      — forza compattazione context
   /memories     — elenca memorie permanenti
+  /last         — mostra dettagli dei tool call dell'ultimo turno
   /clear        — pulisci schermo
   /exit /quit   — esci
 
@@ -55,7 +57,31 @@ class Interactive:
         self._in_prompt   = False          # True solo durante input()
         self._notif_buffer: list = []      # notifiche accumulate fuori dal prompt
         self._notif_lock  = threading.Lock()
+        # Tool call del turno corrente (catturati dallo StreamFilter + listener registry)
+        self._turn_tool_calls: list[dict] = []
+        self._last_tool_calls: list[dict] = []
+        # Cattura silenziosa output comandi (disponibile via /last)
+        self._turn_command_output: list[str] = []
+        self.registry.set_command_output_callback(self._capture_command_output)
+        self.registry.set_execution_listener(self._on_tool_executed)
         self._setup_readline()
+
+    def _capture_command_output(self, line: str) -> None:
+        self._turn_command_output.append(line)
+
+    def _on_tool_executed(self, name: str, args: dict, result: str) -> None:
+        """Aggiorna l'ultimo tool call senza risultato con questo risultato."""
+        for tc in reversed(self._turn_tool_calls):
+            if tc["name"] == name and tc.get("result") is None:
+                tc["args_parsed"] = args if isinstance(args, dict) else {}
+                tc["result"] = result
+                return
+        self._turn_tool_calls.append({
+            "name": name,
+            "args_raw": "",
+            "args_parsed": args if isinstance(args, dict) else {},
+            "result": result,
+        })
 
     def _setup_readline(self):
         try:
@@ -120,6 +146,35 @@ class Interactive:
                 print(CLI.dim(content))
             print()
 
+    def _print_last_tool_calls(self) -> None:
+        """Mostra nome, argomenti e risultato dei tool call dell'ultimo turno."""
+        calls = self._last_tool_calls
+        if not calls:
+            print(CLI.dim("\n  Nessun tool call nell'ultimo turno.\n"))
+            return
+        print()
+        for i, tc in enumerate(calls, 1):
+            print(f"  {CLI.bold(f'[{i}]')} {CLI.cyan(tc['name'])}")
+            args = tc.get("args_parsed") or {}
+            raw = tc.get("args_raw") or ""
+            if args:
+                import json as _json
+                print(CLI.dim("      args: " + _json.dumps(args, ensure_ascii=False)))
+            elif raw:
+                print(CLI.dim("      args: " + raw[:200]))
+            result = tc.get("result")
+            if result:
+                snippet = result if len(result) <= 600 else result[:600] + f"\n      [... {len(result) - 600} char in più]"
+                indented = "\n".join("      " + line for line in snippet.splitlines())
+                print(CLI.dim(indented))
+            else:
+                print(CLI.dim("      (risultato non ancora disponibile)"))
+        if self._turn_command_output:
+            print(CLI.dim(f"\n  ── output comandi ({len(self._turn_command_output)} righe) ──"))
+            for line in self._turn_command_output[-30:]:
+                print(CLI.dim("    " + line.rstrip()))
+        print()
+
     def _show_pending_job_outputs(self) -> None:
         """Mostra output accumulati nel buffer (chiamato prima di ogni prompt)."""
         with self._notif_lock:
@@ -170,17 +225,35 @@ class Interactive:
 
             # Messaggio all'agente
             print(f"\n{CLI.bold(CLI.magenta('ltsia'))} > ", end="", flush=True)
+            self._turn_tool_calls = []
+            self._turn_command_output = []
+
+            def _on_stream_tool_call(name: str, raw: str) -> None:
+                self._turn_tool_calls.append({
+                    "name": name,
+                    "args_raw": raw,
+                    "args_parsed": None,
+                    "result": None,
+                })
+
+            stream_filter = StreamFilter(
+                downstream=lambda chunk: print(chunk, end="", flush=True),
+                on_tool_call=_on_stream_tool_call,
+            )
+
             try:
-                self.agent.chat(
-                    user_input,
-                    on_stream=lambda chunk: print(chunk, end="", flush=True),
-                )
+                self.agent.chat(user_input, on_stream=stream_filter.feed)
+                stream_filter.flush()
                 print("\n")
             except KeyboardInterrupt:
+                stream_filter.flush()
                 print("\n[interrotto]")
             except Exception as e:
+                stream_filter.flush()
                 CLI.error(f"Errore: {e}")
                 print()
+
+            self._last_tool_calls = list(self._turn_tool_calls)
 
     def _handle_command(self, cmd: str) -> bool:
         """Ritorna False se si deve uscire."""
@@ -234,6 +307,9 @@ class Interactive:
         elif cmd_lower == "/memories":
             result = self.registry.execute("list_memories", {})
             print(result)
+
+        elif cmd_lower == "/last":
+            self._print_last_tool_calls()
 
         elif cmd_lower == "/clear":
             os.system("cls" if sys.platform == "win32" else "clear")

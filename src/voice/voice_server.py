@@ -9,8 +9,12 @@ Protocollo JSON su WebSocket:
     {"type":"confirm_yes"}                            conferma "sono io"
     {"type":"confirm_no"}                             nega "non ero io"
     {"type":"enroll_request"}                         avvia enrollment da UI
+    {"type":"snapshot_request"}                       richiede snapshot dashboard
 
   Server → Client:
+    {"type":"snapshot",      "payload":{...}}         snapshot completo dashboard
+    {"type":"jobs_update",   "jobs":[...],            push periodico stato job
+                             "job_logs":[...]}
     {"type":"chunk",         "text":"..."}            chunk streaming risposta
     {"type":"done",          "full":"..."}            risposta completa
     {"type":"tool",          "name":"..."}            tool in esecuzione
@@ -42,7 +46,7 @@ import json
 import re
 import socket
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
 
@@ -66,13 +70,15 @@ def _detect_local_ip() -> str:
 class VoiceServer:
     def __init__(
         self,
-        chat_agent  : "ChatAgent",
-        config      : "Config",
-        job_manager : Optional["JobManager"] = None,
+        chat_agent        : "ChatAgent",
+        config            : "Config",
+        job_manager       : Optional["JobManager"] = None,
+        snapshot_provider : Optional[Callable[[], dict]] = None,
     ):
-        self.chat_agent  = chat_agent
-        self.config      = config
-        self.job_manager = job_manager
+        self.chat_agent        = chat_agent
+        self.config            = config
+        self.job_manager       = job_manager
+        self.snapshot_provider = snapshot_provider
 
         # Stato connessione
         self._is_busy   = False
@@ -163,6 +169,7 @@ class VoiceServer:
         if self.job_manager:
             asyncio.create_task(self._poll_job_notifications())
             asyncio.create_task(self._drain_notifications())
+            asyncio.create_task(self._broadcast_jobs())
 
         async with websockets.serve(self._handle_client, "0.0.0.0", port):
             # Segnala al main thread che il voice server è pronto: STT caricato,
@@ -245,6 +252,11 @@ class VoiceServer:
                 if msg_type == "enroll_request":
                     if pipeline is not None:
                         await loop.run_in_executor(None, pipeline.start_enrollment)
+                    continue
+
+                # ── Dashboard snapshot on-demand ───────────────────────────
+                if msg_type == "snapshot_request":
+                    await self._send_snapshot(websocket, loop)
                     continue
 
                 # ── Messaggio testo tradizionale (fallback/debug) ──────────
@@ -441,6 +453,40 @@ class VoiceServer:
                     "format":      "mp3",
                 })
                 self._notif_queue.task_done()
+
+    # ── Dashboard ─────────────────────────────────────────────────────────────
+
+    async def _send_snapshot(self, websocket, loop: asyncio.AbstractEventLoop) -> None:
+        if not self.snapshot_provider:
+            return
+        try:
+            payload = await loop.run_in_executor(None, self.snapshot_provider)
+        except Exception as exc:
+            await self._send(websocket, {"type": "error", "message": f"snapshot: {exc}"})
+            return
+        await self._send(websocket, {"type": "snapshot", "payload": payload})
+
+    async def _broadcast_jobs(self) -> None:
+        """Push periodico di job + job_logs ai client. Frequenza: 5s."""
+        loop = asyncio.get_event_loop()
+        while True:
+            await asyncio.sleep(5)
+            if self._active_ws is None or self.job_manager is None:
+                continue
+            try:
+                jobs = await loop.run_in_executor(
+                    None, lambda: [j.to_dict() for j in self.job_manager.list_jobs()]
+                )
+                logs = await loop.run_in_executor(
+                    None, lambda: self.job_manager.get_output_history(limit=30)
+                )
+            except Exception:
+                continue
+            await self._send(self._active_ws, {
+                "type":     "jobs_update",
+                "jobs":     jobs,
+                "job_logs": logs,
+            })
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

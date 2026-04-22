@@ -47,6 +47,13 @@ class Config:
         memory_web_fallback_threshold: float = 0.5,
         memory_medium_ttl_days: int = 30,
         memory_short_drawers: int = 20,
+        memory_dedup_threshold: float = 0.93,
+        memory_optimizer_enabled: bool = True,
+        memory_optimizer_interval: int = 900,
+        memory_optimizer_batch: int = 30,
+        memory_optimizer_merge_threshold: float = 0.87,
+        memory_optimizer_auto_merge_threshold: float = 0.97,
+        memory_optimizer_split_min_chars: int = 120,
     ):
         self.thinking_host = thinking_host
         self.thinking_port = thinking_port
@@ -84,6 +91,13 @@ class Config:
         self.memory_web_fallback_threshold = memory_web_fallback_threshold
         self.memory_medium_ttl_days = memory_medium_ttl_days
         self.memory_short_drawers = memory_short_drawers
+        self.memory_dedup_threshold = memory_dedup_threshold
+        self.memory_optimizer_enabled = memory_optimizer_enabled
+        self.memory_optimizer_interval = memory_optimizer_interval
+        self.memory_optimizer_batch = memory_optimizer_batch
+        self.memory_optimizer_merge_threshold = memory_optimizer_merge_threshold
+        self.memory_optimizer_auto_merge_threshold = memory_optimizer_auto_merge_threshold
+        self.memory_optimizer_split_min_chars = memory_optimizer_split_min_chars
 
     @property
     def thinking_base_url(self) -> str:
@@ -193,6 +207,13 @@ class Config:
             "memory_web_fallback_threshold": ("memory_web_fallback_threshold", float),
             "memory_medium_ttl_days": ("memory_medium_ttl_days", int),
             "memory_short_drawers": ("memory_short_drawers", int),
+            "memory_dedup_threshold": ("memory_dedup_threshold", float),
+            "memory_optimizer_enabled": ("memory_optimizer_enabled", lambda v: v.lower() in ("1", "true", "yes")),
+            "memory_optimizer_interval": ("memory_optimizer_interval", int),
+            "memory_optimizer_batch": ("memory_optimizer_batch", int),
+            "memory_optimizer_merge_threshold": ("memory_optimizer_merge_threshold", float),
+            "memory_optimizer_auto_merge_threshold": ("memory_optimizer_auto_merge_threshold", float),
+            "memory_optimizer_split_min_chars": ("memory_optimizer_split_min_chars", int),
         }
         for key, val in data.items():
             if key in ini_map:

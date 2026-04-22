@@ -14,6 +14,8 @@ export function useWebSocket ({
   onSpeakerResult,      // ({verdict, score})  — feedback rilevamento voce
   onSttText,            // ({text})             — testo trascritto da STT
   onSttStatus,          // ({state})            — "transcribing"|"idle"
+  onSnapshot,           // (payload)            — snapshot dashboard
+  onJobsUpdate,         // ({jobs, job_logs})   — push periodico job
 } = {}) {
   const wsRef               = useRef(null)
   const [status, setStatus] = useState('disconnected')
@@ -62,6 +64,9 @@ export function useWebSocket ({
           case 'speaker_result':   onSpeakerResult?.({ verdict: msg.verdict ?? '', score: msg.score ?? 0 });         break
           case 'stt_text':         onSttText?.({ text: msg.text ?? '' });                                             break
           case 'stt_status':       onSttStatus?.({ state: msg.state ?? 'idle' });                                    break
+          // ── dashboard ─────────────────────────────────────────────────────
+          case 'snapshot':         onSnapshot?.(msg.payload ?? {});                                                   break
+          case 'jobs_update':      onJobsUpdate?.({ jobs: msg.jobs ?? [], job_logs: msg.job_logs ?? [] });           break
         }
       } catch { /* ignora non-JSON */ }
     }
@@ -75,7 +80,8 @@ export function useWebSocket ({
   }, [disconnect, onChunk, onDone, onTool, onStatus, onError, onAudio, onStats,
       onSpeakerStatus, onConfirmSpeaking, onEnrollNeeded, onEnrollStart,
       onEnrollProgress, onEnrollDone, onEnrollError,
-      onSpeakerResult, onSttText, onSttStatus])
+      onSpeakerResult, onSttText, onSttStatus,
+      onSnapshot, onJobsUpdate])
 
   const sendMessage = useCallback((text) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {

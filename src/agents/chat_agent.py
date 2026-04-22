@@ -47,6 +47,10 @@ Non rispondere "ok, ricordato" senza aver chiamato il tool.
 - Per ottenere ora, data, variabili d'ambiente o qualsiasi info di sistema → usa SEMPRE execute_command (es: `date`, `echo $HOME`)
 - NON rispondere "non ho accesso" se hai execute_command disponibile
 
+## Regola curl / richieste HTTP
+- Quando usi `curl` via execute_command, aggiungi SEMPRE `--max-time 30` per evitare che si appenda su server lenti o connessioni keep-alive
+- Esempio: `curl --max-time 30 http://localhost:3000`
+
 ## Regole macOS
 - Per APRIRE un'app (Spotify, Safari, Terminal, Finder, ecc.) → usa SEMPRE macos_open_app con target="NomeApp"
 - NON usare read_file, execute_command o altri tool per aprire applicazioni
