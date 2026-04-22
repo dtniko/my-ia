@@ -15,6 +15,37 @@ if TYPE_CHECKING:
     from src.tools.tool_registry import ToolRegistry
     from src.jobs.job_manager import JobManager
 
+import configparser
+import re
+
+
+# ── Helpers Telegram wizard ───────────────────────────────────────────────────
+
+_TELEGRAM_PHRASES = re.compile(
+    r"(configur|setup|imposta|attiv|avvia|inizia|inizializ).{0,20}telegram",
+    re.IGNORECASE,
+)
+
+
+def _is_telegram_setup_phrase(text: str) -> bool:
+    return bool(_TELEGRAM_PHRASES.search(text))
+
+
+def _save_telegram_config(token: str, voice_reply: bool, allowed_ids: str) -> None:
+    """Salva i parametri Telegram in ltsia.ini (crea il file se non esiste)."""
+    ini_path = Path("ltsia.ini")
+    parser = configparser.RawConfigParser()
+    if ini_path.exists():
+        parser.read(str(ini_path))
+    if not parser.has_section("ltsia"):
+        parser.add_section("ltsia")
+    parser.set("ltsia", "telegram_token", token)
+    parser.set("ltsia", "telegram_voice_reply", "true" if voice_reply else "false")
+    parser.set("ltsia", "telegram_allowed_ids", allowed_ids)
+    with open(str(ini_path), "w") as f:
+        parser.write(f)
+
+
 HELP_TEXT = """
 Comandi disponibili:
   /help         — questo messaggio
@@ -27,6 +58,7 @@ Comandi disponibili:
   /compact      — forza compattazione context
   /memories     — elenca memorie permanenti
   /last         — mostra dettagli dei tool call dell'ultimo turno
+  /telegram     — configura e avvia il bot Telegram
   /clear        — pulisci schermo
   /exit /quit   — esci
 
@@ -47,12 +79,14 @@ class Interactive:
         work_dir: str,
         voice_status: str = "",
         job_manager: Optional["JobManager"] = None,
+        telegram_start_callback=None,
     ):
         self.agent        = agent
         self.registry     = registry
         self.work_dir     = work_dir
         self.voice_status = voice_status
         self.job_manager  = job_manager
+        self._telegram_start = telegram_start_callback  # (token, voice_reply, language, allowed_ids) -> str
         # Stato notifiche background
         self._in_prompt   = False          # True solo durante input()
         self._notif_buffer: list = []      # notifiche accumulate fuori dal prompt
@@ -223,6 +257,11 @@ class Interactive:
                 else:
                     break
 
+            # Configurazione guidata Telegram
+            if _is_telegram_setup_phrase(user_input):
+                self._wizard_telegram()
+                continue
+
             # Messaggio all'agente
             print(f"\n{CLI.bold(CLI.magenta('ltsia'))} > ", end="", flush=True)
             self._turn_tool_calls = []
@@ -314,7 +353,66 @@ class Interactive:
         elif cmd_lower == "/clear":
             os.system("cls" if sys.platform == "win32" else "clear")
 
+        elif cmd_lower in ("/telegram", "/tg"):
+            self._wizard_telegram()
+
         else:
             CLI.warning(f"Comando sconosciuto: {cmd_lower}. Usa /help")
 
         return True
+
+    # ── Wizard Telegram ───────────────────────────────────────────────────────
+
+    def _wizard_telegram(self) -> None:
+        """Procedura guidata per configurare e avviare il bot Telegram."""
+        print()
+        CLI.header("Configurazione Telegram Bot")
+
+        if not self._telegram_start:
+            CLI.error("Callback di avvio Telegram non disponibile.")
+            return
+
+        # Token
+        print("  Ottieni il token da @BotFather su Telegram.")
+        try:
+            token = input("  Token bot: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            CLI.warning("Configurazione annullata.")
+            return
+        if not token:
+            CLI.warning("Token vuoto — configurazione annullata.")
+            return
+
+        # Voce
+        try:
+            voice_in = input("  Rispondi con voce ai messaggi vocali? [S/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            CLI.warning("Configurazione annullata.")
+            return
+        voice_reply = voice_in not in ("n", "no")
+
+        # Chat ID
+        print("  Puoi limitare il bot al tuo chat_id (consigliato).")
+        print("  Scrivi /start al bot su Telegram per vedere il tuo chat_id,")
+        print("  oppure lascia vuoto per accettare tutti.")
+        try:
+            ids_in = input("  Chat ID autorizzati (es. 123456,789012): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            CLI.warning("Configurazione annullata.")
+            return
+
+        print()
+        CLI.step("Salvataggio configurazione in ltsia.ini…")
+        _save_telegram_config(token, voice_reply, ids_in)
+
+        CLI.step("Avvio bot Telegram…")
+        status = self._telegram_start(token, voice_reply, ids_in)
+        if status:
+            CLI.success(f"Telegram bot avviato: {status}")
+            print()
+        else:
+            CLI.error("Avvio fallito — controlla il token e la connessione.")
+            print()

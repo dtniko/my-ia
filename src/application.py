@@ -438,12 +438,18 @@ class Application:
             CLI.success(f"Memory optimizer: {optimizer_status}")
         atexit.register(self._stop_memory_optimizer)
 
+        telegram_status = self._start_telegram_background()
+        if telegram_status:
+            CLI.success(f"Telegram bot: {telegram_status}")
+        atexit.register(self._stop_telegram)
+
         repl = Interactive(
             self.chat_agent,
             self.registry,
             self.config.work_dir,
             voice_status=voice_status,
             job_manager=self.job_manager,
+            telegram_start_callback=self._setup_and_start_telegram,
         )
         try:
             repl.run()
@@ -509,6 +515,72 @@ class Application:
                 agent.stop()
             except Exception:
                 pass
+
+    def _start_telegram_background(self) -> str:
+        """Avvia il bot Telegram in un thread daemon. Ritorna label status o ''."""
+        cfg = self.config
+        if not cfg.telegram_token:
+            return ""
+        try:
+            from src.telegram.telegram_bot import TelegramBot
+            from src.http.openai_client import OpenAIClient
+            from src.http.ptc_adapter import PTCAdapter
+            from src.agents.chat_agent import ChatAgent
+            import threading
+
+            # ChatAgent dedicato — sessione Telegram separata dal REPL
+            tg_client = PTCAdapter(OpenAIClient(cfg.exec_base_url))
+            tg_agent = ChatAgent(
+                client=tg_client,
+                model=cfg.exec_model,
+                registry=self.registry,
+                memory=self.memory,
+                work_dir=cfg.work_dir,
+                context_window=cfg.context_window,
+            )
+
+            bot = TelegramBot(
+                token=cfg.telegram_token,
+                chat_agent=tg_agent,
+                config=cfg,
+                voice_reply=cfg.telegram_voice_reply,
+                language=cfg.telegram_language,
+                allowed_chat_ids=cfg.telegram_allowed_ids,
+            )
+            t = threading.Thread(target=bot.run, daemon=True, name="telegram-bot")
+            t.start()
+            self._telegram_bot = bot
+            ids_label = f" · ids: {cfg.telegram_allowed_ids}" if cfg.telegram_allowed_ids else " · aperto a tutti"
+            return f"attivo · voce: {'sì' if cfg.telegram_voice_reply else 'no'}{ids_label}"
+        except Exception as e:
+            CLI.warning(f"Telegram bot non avviato: {e}")
+            return ""
+
+    def _stop_telegram(self):
+        bot = getattr(self, "_telegram_bot", None)
+        if bot:
+            try:
+                bot.stop()
+            except Exception:
+                pass
+
+    def _setup_and_start_telegram(self, token: str, voice_reply: bool, allowed_ids_str: str) -> str:
+        """
+        Chiamato dal wizard interattivo: aggiorna config in memoria e avvia il bot.
+        Ritorna label status o '' se fallisce.
+        """
+        # Ferma eventuale bot già in esecuzione
+        self._stop_telegram()
+        self._telegram_bot = None
+
+        # Aggiorna config in memoria
+        self.config.telegram_token = token
+        self.config.telegram_voice_reply = voice_reply
+        self.config.telegram_allowed_ids = [
+            int(x.strip()) for x in allowed_ids_str.split(",") if x.strip().isdigit()
+        ]
+
+        return self._start_telegram_background()
 
     def voice(self, port: int = 8765) -> int:
         """Modalità voice standalone: avvia solo il WebSocket server (bloccante)."""
@@ -639,6 +711,10 @@ class Application:
                 f"Fallback web soglia: {self.config.memory_web_fallback_threshold} · "
                 f"TTL medio termine: {self.config.memory_medium_ttl_days}g"
             )
+        if self.config.telegram_token:
+            CLI.success(f"Telegram bot: token configurato · lingua STT: {self.config.telegram_language}")
+        else:
+            CLI.info("Telegram bot: non configurato (imposta telegram_token in ltsia.ini o LTSIA_TELEGRAM_TOKEN)")
         for pkg in ["requests"]:
             try:
                 __import__(pkg)

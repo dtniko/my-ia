@@ -54,6 +54,10 @@ class Config:
         memory_optimizer_merge_threshold: float = 0.87,
         memory_optimizer_auto_merge_threshold: float = 0.97,
         memory_optimizer_split_min_chars: int = 120,
+        telegram_token: str = "",
+        telegram_voice_reply: bool = True,
+        telegram_language: str = "it",
+        telegram_allowed_ids: str = "",
     ):
         self.thinking_host = thinking_host
         self.thinking_port = thinking_port
@@ -98,6 +102,13 @@ class Config:
         self.memory_optimizer_merge_threshold = memory_optimizer_merge_threshold
         self.memory_optimizer_auto_merge_threshold = memory_optimizer_auto_merge_threshold
         self.memory_optimizer_split_min_chars = memory_optimizer_split_min_chars
+        self.telegram_token = telegram_token or os.environ.get("LTSIA_TELEGRAM_TOKEN", "")
+        self.telegram_voice_reply = telegram_voice_reply
+        self.telegram_language = telegram_language
+        # "123456,789012" → [123456, 789012]
+        self.telegram_allowed_ids: list[int] = [
+            int(x.strip()) for x in telegram_allowed_ids.split(",") if x.strip().isdigit()
+        ]
 
     @property
     def thinking_base_url(self) -> str:
@@ -214,6 +225,10 @@ class Config:
             "memory_optimizer_merge_threshold": ("memory_optimizer_merge_threshold", float),
             "memory_optimizer_auto_merge_threshold": ("memory_optimizer_auto_merge_threshold", float),
             "memory_optimizer_split_min_chars": ("memory_optimizer_split_min_chars", int),
+            "telegram_token": "telegram_token",
+            "telegram_voice_reply": ("telegram_voice_reply", lambda v: v.lower() in ("1", "true", "yes")),
+            "telegram_language": "telegram_language",
+            "telegram_allowed_ids": "telegram_allowed_ids",
         }
         for key, val in data.items():
             if key in ini_map:
