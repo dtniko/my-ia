@@ -1,4 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+
+# Virtualenv
 .venv/
 .venv311/
-.idea/
+venv/
+env/
+ENV/
 
+# Node / frontend
+node_modules/
+voice/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime / secrets
+*.log
+ltsia.ini
+.env
+.env.*
