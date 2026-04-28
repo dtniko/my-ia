@@ -42,6 +42,7 @@ class Application:
 
         CLI.step("Inizializzazione client LLM...")
         self.ollama = OllamaClient(config.thinking_base_url, timeout=config.ollama_timeout)
+        self.planning_ollama = OllamaClient(config.thinking_base_url, timeout=config.ollama_timeout)
         self.openai = PTCAdapter(OpenAIClient(config.exec_base_url))
 
         CLI.step("Inizializzazione memoria...")
@@ -278,8 +279,8 @@ class Application:
             initial_context=session_ctx.text,
         )
         self.pm_agent = ProjectManagerAgent(
-            client=self.openai,
-            model=model,
+            client=self.planning_ollama,
+            model=cfg.planning_model,
             registry=self.registry,
             context_window=cfg.context_window,
         )
@@ -454,6 +455,9 @@ class Application:
         try:
             repl.run()
         finally:
+            vs = getattr(self, "_voice_server", None)
+            if vs is not None:
+                vs.stop()
             self._stop_qdrant_viz()
             self._stop_memory_optimizer()
 
@@ -647,6 +651,7 @@ class Application:
         )
         t = threading.Thread(target=server.run, args=(port,), daemon=True)
         t.start()
+        self._voice_server = server
 
         # Aspetta che il voice server abbia terminato il preload (Whisper, ECAPA)
         # e sia in ascolto. Timeout generoso per CPU lente.
@@ -781,6 +786,14 @@ class Application:
                 "name":           cfg.exec_model,
                 "context_window": cfg.context_window,
                 "url":            cfg.exec_base_url,
+            },
+            "thinking_model": {
+                "name": cfg.thinking_model,
+                "url":  f"http://{cfg.thinking_host}:{cfg.thinking_port}",
+            },
+            "planning_model": {
+                "name": cfg.planning_model,
+                "url":  f"http://{cfg.thinking_host}:{cfg.thinking_port}",
             },
             "agents":  {"count": len(agents),  "names": agents},
             "modules": {"count": len(modules), "names": modules},

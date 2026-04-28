@@ -36,6 +36,8 @@ class Config:
         tts_enabled: bool = False,
         tts_voice: str = "it-IT-IsabellaNeural",
         tts_rate: str = "+20%",
+        stt_model: str = "base",
+        stt_cpu_threads: int = 4,
         supermemory_api_key: str = "",
         supermemory_space_id: str = "",
         ollama_timeout: int = 1800,
@@ -54,6 +56,7 @@ class Config:
         memory_optimizer_merge_threshold: float = 0.87,
         memory_optimizer_auto_merge_threshold: float = 0.97,
         memory_optimizer_split_min_chars: int = 120,
+        planning_model: str = "gemma4:26b-a4b-it-q4_K_M",
         telegram_token: str = "",
         telegram_voice_reply: bool = True,
         telegram_language: str = "it",
@@ -84,6 +87,8 @@ class Config:
         self.tts_enabled = tts_enabled
         self.tts_voice = tts_voice
         self.tts_rate = tts_rate
+        self.stt_model = stt_model
+        self.stt_cpu_threads = stt_cpu_threads
         self.supermemory_api_key = supermemory_api_key
         self.supermemory_space_id = supermemory_space_id
         self.ollama_timeout = ollama_timeout
@@ -102,6 +107,7 @@ class Config:
         self.memory_optimizer_merge_threshold = memory_optimizer_merge_threshold
         self.memory_optimizer_auto_merge_threshold = memory_optimizer_auto_merge_threshold
         self.memory_optimizer_split_min_chars = memory_optimizer_split_min_chars
+        self.planning_model = planning_model
         self.telegram_token = telegram_token or os.environ.get("LTSIA_TELEGRAM_TOKEN", "")
         self.telegram_voice_reply = telegram_voice_reply
         self.telegram_language = telegram_language
@@ -207,6 +213,8 @@ class Config:
             "tts_enabled": ("tts_enabled", lambda v: v.lower() in ("1", "true", "yes")),
             "tts_voice": "tts_voice",
             "tts_rate": "tts_rate",
+            "stt_model": "stt_model",
+            "stt_cpu_threads": ("stt_cpu_threads", int),
             "supermemory_api_key": "supermemory_api_key",
             "supermemory_space_id": "supermemory_space_id",
             "ollama_timeout": ("ollama_timeout", int),
@@ -225,6 +233,7 @@ class Config:
             "memory_optimizer_merge_threshold": ("memory_optimizer_merge_threshold", float),
             "memory_optimizer_auto_merge_threshold": ("memory_optimizer_auto_merge_threshold", float),
             "memory_optimizer_split_min_chars": ("memory_optimizer_split_min_chars", int),
+            "planning_model": "planning_model",
             "telegram_token": "telegram_token",
             "telegram_voice_reply": ("telegram_voice_reply", lambda v: v.lower() in ("1", "true", "yes")),
             "telegram_language": "telegram_language",

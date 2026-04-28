@@ -72,8 +72,8 @@ export function useWebSocket ({
     }
 
     ws.onerror = () => {
-      const msg = 'Impossibile connettersi al server WebSocket'
-      setError(msg); setStatus('error'); onError?.(msg)
+      // Non notifica: onclose parte subito dopo e gestisce la riconnessione
+      setStatus('error')
     }
 
     ws.onclose = () => { wsRef.current = null; setStatus('disconnected') }

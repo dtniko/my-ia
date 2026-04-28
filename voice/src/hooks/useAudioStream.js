@@ -87,6 +87,42 @@ async function loadWorklet (ctx) {
   }
 }
 
+// ── Performance logging ───────────────────────────────────────────────────────
+
+// Conta i chunk inviati e logga rate + tempo encode ogni 5s
+function makeChunkLogger () {
+  let count     = 0
+  let totalMs   = 0
+  let lastLog   = performance.now()
+
+  return function logChunk (encodeMs) {
+    count++
+    totalMs += encodeMs
+    const now  = performance.now()
+    const elapsed = now - lastLog
+    if (elapsed >= 5000) {
+      const rate    = (count / (elapsed / 1000)).toFixed(1)
+      const avgEnc  = count > 0 ? (totalMs / count).toFixed(2) : 0
+      console.debug(`[audio] ${rate} chunk/s | encode avg ${avgEnc}ms (${count} chunk in ${(elapsed/1000).toFixed(1)}s)`)
+      count = 0; totalMs = 0; lastLog = now
+    }
+  }
+}
+
+// Rileva long task (>50 ms) nel main thread tramite PerformanceObserver
+function observeLongTasks () {
+  if (typeof PerformanceObserver === 'undefined') return
+  try {
+    const obs = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        console.warn(`[perf] Long task: ${entry.duration.toFixed(1)}ms @ ${entry.startTime.toFixed(0)}ms`)
+      }
+    })
+    obs.observe({ type: 'longtask', buffered: false })
+    console.debug('[perf] LongTask observer attivo')
+  } catch (_) { /* browser non supporta longtask */ }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function float32ToBase64 (f32) {
@@ -114,6 +150,8 @@ export function useAudioStream ({ sendRaw, enabled = true, muted = false } = {})
   useEffect(() => { mutedRef.current   = muted    }, [muted])
   useEffect(() => { enabledRef.current = enabled  }, [enabled])
 
+  const logChunkRef = useRef(null)
+
   const start = useCallback(async () => {
     if (ctxRef.current) return
     if (typeof AudioWorkletNode === 'undefined') {
@@ -133,16 +171,24 @@ export function useAudioStream ({ sendRaw, enabled = true, muted = false } = {})
       })
 
       const ctx = new AudioContext({ sampleRate: 16000 })
+      console.debug(`[audio] AudioContext sampleRate effettivo: ${ctx.sampleRate}Hz`)
       await loadWorklet(ctx)
+
+      observeLongTasks()
+      logChunkRef.current = makeChunkLogger()
 
       const source  = ctx.createMediaStreamSource(stream)
       const worklet = new AudioWorkletNode(ctx, 'audio-processor')
 
       worklet.port.onmessage = (e) => {
         if (mutedRef.current || !enabledRef.current) return
+        const t0  = performance.now()
+        const b64 = float32ToBase64(e.data)
+        const enc = performance.now() - t0
+        logChunkRef.current?.(enc)
         sendRef.current?.({
           type: 'audio_chunk',
-          data: float32ToBase64(e.data),
+          data: b64,
           sr:   16000,
         })
       }

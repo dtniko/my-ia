@@ -122,6 +122,7 @@ class ChatAgent(BaseAgent):
         self,
         user_message: str,
         on_stream: Optional[Callable[[str], None]] = None,
+        on_tool_start: Optional[Callable[[str, dict], None]] = None,
     ) -> str:
         """Invia un messaggio e ottieni risposta. Mantiene contesto."""
 
@@ -145,6 +146,7 @@ class ChatAgent(BaseAgent):
             context=self.context,
             tool_schemas=tools,
             on_stream=on_stream,
+            on_tool_start=on_tool_start,
         )
 
         # Post-turn: ingest di drawer in short-term + estrazione fatti via ASMR reader

@@ -21,11 +21,20 @@ import asyncio
 import collections
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
 from typing import Callable, Coroutine, Optional, TYPE_CHECKING
 
 import numpy as np
+
+# Usa lo stesso logger di voice_server se già inizializzato, altrimenti crea
+import logging as _logging
+_timing_logger = _logging.getLogger("ltsia.timing")
+
+def _tlog(msg: str) -> None:
+    print(msg, flush=True)
+    _timing_logger.debug(msg)
 
 if TYPE_CHECKING:
     from src.voice.speaker_verifier import SpeakerVerifier
@@ -39,7 +48,8 @@ SAMPLE_RATE        = 16000
 FRAME_SAMPLES      = 480           # 30 ms a 16 kHz
 FRAME_BYTES        = FRAME_SAMPLES * 2  # int16
 PADDING_FRAMES     = 10            # 300 ms pre/post-speech — determina anche il trigger di fine parlato
-MIN_SEG_SAMPLES    = int(SAMPLE_RATE * 0.3)   # minimo 300 ms per processare
+MIN_SEG_SAMPLES    = int(SAMPLE_RATE * 0.4)   # minimo 400 ms per processare
+MIN_RMS_ENERGY     = 0.004                    # gate energetico: sotto questa soglia il segmento è scartato
 
 ENROLL_DURATION_S  = 25            # secondi di parlato per un enrollment
 MIN_ENROLL_SEGS    = 5             # segmenti minimi per l'enrollment
@@ -62,16 +72,73 @@ _CMD_CONFIRM_NO  = [
     "non stavo parlando con te", "non ero io",
 ]
 
+# Frasi di commiato/chiusura che terminano la sessione conversazionale.
+# Dopo una di queste, Daniela torna a richiedere la wake word.
+_DISMISSALS = [
+    "ok grazie", "grazie", "grazie mille", "grazie daniela",
+    "ho capito", "ok ho capito", "ho capito grazie", "capito",
+    "capito grazie", "va bene", "ok va bene", "va bene grazie",
+    "va bene daniela", "ok grazie daniela", "bene grazie",
+    "d accordo", "perfetto grazie", "ottimo grazie",
+    "ok ciao", "ciao daniela", "arrivederci", "arrivederci daniela",
+    "a dopo", "a dopo daniela", "ci vediamo", "alla prossima",
+]
+# _matches già normalizza le varianti della wake word prima del confronto,
+# quindi i dismissal sopra con "daniela" coprono anche "daniele", "danielle" ecc.
+_MAX_DISMISSAL_WORDS = 8   # sopra questa soglia non è un commiato
+
+
+# Varianti della wake word prodotte da Whisper per "Daniela"
+_WAKE_VARIANTS = {
+    "daniela", "daniele", "danielle", "daniella", "daniel",
+    "dani ela", "danie la", "daniella",
+}
+
 
 def _norm(text: str) -> str:
     return re.sub(r"[^a-zàèéìòùü ]", "", text.lower().strip())
 
 
+def _has_wake_word(text: str) -> bool:
+    """True se il testo contiene una variante riconosciuta della wake word."""
+    n = _norm(text)
+    words = n.split()
+    # Controlla parola singola
+    for w in words:
+        if w in _WAKE_VARIANTS:
+            return True
+    # Controlla bigram (es. "dani ela")
+    for i in range(len(words) - 1):
+        bigram = words[i] + " " + words[i + 1]
+        if bigram in _WAKE_VARIANTS:
+            return True
+    return False
+
+
+def _normalize_wake(text: str) -> str:
+    """Sostituisce varianti della wake word con 'daniela' per i match comandi."""
+    n = _norm(text)
+    for v in _WAKE_VARIANTS - {"daniela"}:
+        n = re.sub(r"\b" + re.escape(v) + r"\b", "daniela", n)
+    return n
+
+
 def _matches(text: str, commands: list[str]) -> bool:
-    # Aggiunge spazi attorno al testo per il controllo word-boundary
-    # (es. "no" non deve matchare "non lo so")
-    n = " " + _norm(text) + " "
+    # Normalizza le varianti della wake word prima di confrontare
+    n = " " + _normalize_wake(text) + " "
     return any((" " + cmd + " ") in n for cmd in commands)
+
+
+def _is_dismissal(text: str) -> bool:
+    """
+    True se il testo è una frase di chiusura conversazione.
+    Limite di parole: frasi lunghe non vengono mai trattate come commiato
+    anche se contengono parole come "grazie" o "va bene".
+    """
+    n = _norm(text)
+    if len(n.split()) > _MAX_DISMISSAL_WORDS:
+        return False
+    return _matches(text, _DISMISSALS)
 
 
 # ── Stato pipeline ─────────────────────────────────────────────────────────────
@@ -112,6 +179,11 @@ class AudioPipeline:
         # (usato durante TTS per evitare che l'IA si auto-ascolti)
         self._deaf         : bool               = False
 
+        # Stato conversazionale: True = Daniela è già stata invocata,
+        # le frasi successive non richiedono la wake word.
+        # Torna False dopo una frase di commiato.
+        self._in_conversation: bool             = False
+
         # VAD streaming state
         self._ring         : collections.deque = collections.deque(maxlen=PADDING_FRAMES)
         self._voiced_f32   : list[np.ndarray]  = []
@@ -124,12 +196,25 @@ class AudioPipeline:
         self._pending_text : Optional[str]       = None
         self._pending_seg  : Optional[np.ndarray] = None  # audio del segmento in attesa di conferma
 
+        # Flag atomico: True mentre un _process_segment è in esecuzione.
+        # Se arriva un nuovo segmento con STT già occupata, viene scartato
+        # per evitare accodamento che degrada i tempi a decine di secondi.
+        self._stt_busy     : bool                = False
+
         # Enrollment state
         self._enroll_segs      : list[np.ndarray] = []
         self._enroll_speech_s  : float            = 0.0
 
         # Worker
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pipeline")
+
+        # Contatori per rate logging
+        self._chunk_count   : int   = 0
+        self._segment_count : int   = 0
+        self._rate_window   : float = time.monotonic()
+
+        # Timing end-to-end: t0 = quando il VAD chiude il segmento parlato
+        self._t_vad_end     : float = 0.0
 
     # ── Entry point (chiamato dal loop asyncio) ───────────────────────────────
 
@@ -153,6 +238,18 @@ class AudioPipeline:
             return  # IA sta parlando — scarta
         if sr != SAMPLE_RATE:
             audio = _resample_f32(audio, sr, SAMPLE_RATE)
+
+        self._chunk_count += 1
+        now = time.monotonic()
+        elapsed = now - self._rate_window
+        if elapsed >= 10.0:
+            chunk_rate = self._chunk_count / elapsed
+            seg_rate   = self._segment_count / elapsed
+            print(f"[pipeline] rate: {chunk_rate:.1f} chunk/s | {seg_rate:.2f} segmenti/s "
+                  f"({self._chunk_count} chunk, {self._segment_count} seg in {elapsed:.0f}s)")
+            self._chunk_count   = 0
+            self._segment_count = 0
+            self._rate_window   = now
 
         combined       = np.concatenate([self._leftover, audio])
         n_frames       = len(combined) // FRAME_SAMPLES
@@ -183,7 +280,7 @@ class AudioPipeline:
                 except Exception as exc:
                     print(f"[pipeline] Aggiornamento voice print fallito: {exc}")
             if text:
-                self._schedule_chat(text)
+                self._dispatch_text(text)
 
     def start_enrollment(self) -> None:
         """Avvia l'enrollment (chiamabile anche da UI via messaggio WebSocket)."""
@@ -235,12 +332,24 @@ class AudioPipeline:
         seg = np.concatenate(frames)
         if len(seg) < MIN_SEG_SAMPLES:
             return
+        self._segment_count += 1
+        self._t_vad_end = time.monotonic()
+        dur_ms = len(seg) / SAMPLE_RATE * 1000
+        rms    = float(np.sqrt(np.mean(seg ** 2)))
+        if rms < MIN_RMS_ENERGY:
+            print(f"[pipeline] segmento scartato (energia troppo bassa: rms={rms:.4f} < {MIN_RMS_ENERGY})")
+            return
+        if self._stt_busy:
+            print(f"[pipeline] segmento scartato (STT occupata): {dur_ms:.0f}ms rms={rms:.4f}")
+            return
+        print(f"[pipeline] segmento rilevato: {dur_ms:.0f}ms rms={rms:.4f}")
         # NON catturare lo stato qui: il worker lo legge al momento dell'esecuzione
         # per evitare race condition con _finish_enrollment.
         try:
+            self._stt_busy = True
             self._executor.submit(self._process_segment, seg)
         except RuntimeError:
-            pass  # executor già spento (shutdown durante disconnessione)
+            self._stt_busy = False
 
     # ── Worker (thread separato) ──────────────────────────────────────────────
 
@@ -249,21 +358,24 @@ class AudioPipeline:
         with self._lock:
             state = self._state
 
+        t0 = time.monotonic()
         try:
             if state == PipelineState.ENROLLING:
                 self._handle_enroll_segment(seg)
 
             elif state == PipelineState.CONFIRMING:
-                text = self._stt.transcribe(seg)
-                print(f"[pipeline] confirm input: {text!r}")
+                t_stt = time.monotonic()
+                text  = self._stt.transcribe(seg)
+                print(f"[pipeline] confirm STT: {(time.monotonic()-t_stt)*1000:.0f}ms → {text!r}")
                 if _matches(text, _CMD_CONFIRM_YES):
                     self.handle_confirm_response(True)
                 elif _matches(text, _CMD_CONFIRM_NO):
                     self.handle_confirm_response(False)
 
             elif state == PipelineState.PAUSED:
-                text = self._stt.transcribe(seg)
-                print(f"[pipeline] (pausa) {text!r}")
+                t_stt = time.monotonic()
+                text  = self._stt.transcribe(seg)
+                print(f"[pipeline] (pausa) STT: {(time.monotonic()-t_stt)*1000:.0f}ms → {text!r}")
                 if _matches(text, _CMD_RESUME):
                     with self._lock:
                         self._state = PipelineState.ACTIVE
@@ -275,18 +387,35 @@ class AudioPipeline:
 
         except Exception as exc:
             print(f"[pipeline] Errore worker: {exc}")
+        finally:
+            self._stt_busy = False
+            elapsed = (time.monotonic() - t0) * 1000
+            if elapsed > 2000:
+                print(f"[pipeline] ⚠ segmento lento: {elapsed:.0f}ms (stato={state.name})")
 
     def _handle_active(self, seg: np.ndarray) -> None:
+        t0    = self._t_vad_end  # riferimento comune per tutti i delta
+        dur_s = len(seg) / SAMPLE_RATE
+
+        def _dt(label: str) -> None:
+            ms = (time.monotonic() - t0) * 1000
+            _tlog(f"[timing] +{ms:6.0f}ms  {label}")
+
+        _dt("worker STT avviato")
+
         if not self._verifier.is_enrolled:
             # Nessun voice print → processa tutto senza verifica
             self._emit({"type": "stt_status", "state": "transcribing"})
-            text = self._stt.transcribe(seg)
+            t_stt = time.monotonic()
+            text  = self._stt.transcribe(seg)
+            stt_ms = (time.monotonic() - t_stt) * 1000
             self._emit({"type": "stt_status", "state": "idle"})
+            _dt(f"STT completato ({stt_ms:.0f}ms, audio {dur_s:.2f}s) → {text!r}")
             if not text:
                 return
-            print(f"[pipeline] testo (no vp): {text!r}")
             self._emit({"type": "stt_text", "text": text})
             self._dispatch_text(text)
+            _dt("dispatch_text chiamato")
             return
 
         # ── Verify e transcribe in parallelo ─────────────────────────────────
@@ -294,9 +423,11 @@ class AudioPipeline:
         # non paghiamo il tempo di attesa sequenziale verify → transcribe.
         self._emit({"type": "stt_status", "state": "transcribing"})
 
-        verify_result : list = []
-        transcribe_result: list = []
-        verify_done = threading.Event()
+        verify_result    : list  = []
+        transcribe_result: list  = []
+        verify_done              = threading.Event()
+        t_verify_start           = time.monotonic()
+        t_stt_start              = time.monotonic()
 
         def _do_verify():
             try:
@@ -306,6 +437,7 @@ class AudioPipeline:
                 print(f"[pipeline] Errore verifica: {exc}")
             finally:
                 verify_done.set()
+                _dt(f"verify completato ({(time.monotonic()-t_verify_start)*1000:.0f}ms)")
 
         def _do_transcribe():
             try:
@@ -313,6 +445,7 @@ class AudioPipeline:
             except Exception as exc:
                 transcribe_result.append("")
                 print(f"[pipeline] Errore trascrizione: {exc}")
+            _dt(f"STT completato ({(time.monotonic()-t_stt_start)*1000:.0f}ms, audio {dur_s:.2f}s)")
 
         t_verify     = threading.Thread(target=_do_verify,     daemon=True)
         t_transcribe = threading.Thread(target=_do_transcribe, daemon=True)
@@ -342,6 +475,7 @@ class AudioPipeline:
 
         # Aspetta trascrizione (potrebbe già essere pronta)
         t_transcribe.join()
+        _dt("STT join completato")
         self._emit({"type": "stt_status", "state": "idle"})
         text = transcribe_result[0] if transcribe_result else ""
         if not text:
@@ -364,6 +498,7 @@ class AudioPipeline:
             return
 
         self._dispatch_text(text)
+        _dt("dispatch_text → chat schedulato")
 
     def _auto_update_voiceprint(self, seg: np.ndarray) -> None:
         """
@@ -377,14 +512,37 @@ class AudioPipeline:
             print(f"[pipeline] Auto-update voice print fallito: {exc}")
 
     def _dispatch_text(self, text: str) -> None:
+        # Comandi di sistema — precedenza assoluta
         if _matches(text, _CMD_PAUSE):
             self._do_pause()
-        elif _matches(text, _CMD_RESUME):
-            pass  # già attivo
-        elif _matches(text, _CMD_ENROLL):
+            return
+        if _matches(text, _CMD_RESUME):
+            return   # già attivo
+        if _matches(text, _CMD_ENROLL):
             self.start_enrollment()
-        else:
+            return
+
+        # Logica wake word + stato conversazione
+        has_wake = _has_wake_word(text)
+        is_bye   = _is_dismissal(text)
+
+        if is_bye and self._in_conversation:
+            # Commiato: chiudi la sessione senza rispondere
+            self._in_conversation = False
+            print("[pipeline] Sessione conversazione chiusa (commiato)")
+            return
+
+        if self._in_conversation:
+            # Già in conversazione: risponde sempre (no wake word richiesta)
             self._schedule_chat(text)
+        elif has_wake:
+            # Prima invocazione con wake word: apri sessione
+            self._in_conversation = True
+            print(f"[pipeline] Wake word rilevata in: {text!r}")
+            self._schedule_chat(text)
+        else:
+            # Nessuna wake word e non in conversazione: ignora
+            print(f"[pipeline] Ignorato (no wake word, no sessione): {text!r}")
 
     # ── Enrollment ────────────────────────────────────────────────────────────
 
@@ -441,15 +599,21 @@ class AudioPipeline:
 
     def _emit(self, msg: dict) -> None:
         """Invia un messaggio al client WebSocket dal thread worker."""
-        asyncio.run_coroutine_threadsafe(
-            self._send_fn(msg), self._loop
-        )
+        if self._loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._send_fn(msg), self._loop)
+        except RuntimeError:
+            pass
 
     def _schedule_chat(self, text: str) -> None:
         """Schedula la risposta del ChatAgent nel loop asyncio."""
-        asyncio.run_coroutine_threadsafe(
-            self._chat_fn(text), self._loop
-        )
+        if self._loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._chat_fn(text), self._loop)
+        except RuntimeError:
+            pass
 
 
 # ── Resampling utility ────────────────────────────────────────────────────────

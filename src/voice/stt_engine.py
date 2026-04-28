@@ -18,18 +18,22 @@ class STTEngine:
         model_size: str  = "small",
         language: str    = "it",
         device: str      = "auto",
+        cpu_threads: int = 2,
     ):
         """
-        model_size: "tiny" (39 MB), "base" (74 MB), "small" (244 MB, consigliato),
-                    "medium" (769 MB), "large-v3" (1.5 GB)
-        language:   codice lingua ISO 639-1 (es. "it", "en")
-        device:     "auto" | "cpu" | "cuda"
+        model_size:  "tiny" (39 MB), "base" (74 MB), "small" (244 MB, consigliato),
+                     "medium" (769 MB), "large-v3" (1.5 GB)
+        language:    codice lingua ISO 639-1 (es. "it", "en")
+        device:      "auto" | "cpu" | "cuda"
+        cpu_threads: core massimi usati da CTranslate2 (default 2).
+                     Riduce il picco CPU a scapito di latenza leggermente maggiore.
         """
-        self._model_size = model_size
-        self._language   = language
-        self._device     = device
-        self._model      = None
-        self._lock       = threading.Lock()
+        self._model_size  = model_size
+        self._language    = language
+        self._device      = device
+        self._cpu_threads = cpu_threads
+        self._model       = None
+        self._lock        = threading.Lock()
 
     # ── Lazy load ─────────────────────────────────────────────────────────────
 
@@ -52,9 +56,14 @@ class STTEngine:
                 device = "cpu"
 
         compute = "float16" if device == "cuda" else "int8"
-        print(f"[stt] Caricamento modello Whisper '{self._model_size}' su {device}…")
+        print(f"[stt] Caricamento modello Whisper '{self._model_size}' su {device} "
+              f"(cpu_threads={self._cpu_threads}, compute={compute})…")
         self._model = WhisperModel(
-            self._model_size, device=device, compute_type=compute
+            self._model_size,
+            device=device,
+            compute_type=compute,
+            cpu_threads=self._cpu_threads,
+            num_workers=1,
         )
         print("[stt] Modello pronto.")
 

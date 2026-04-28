@@ -2,9 +2,23 @@
 from __future__ import annotations
 import base64
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+
+# Rimuove emoji e simboli grafici dal testo prima della sintesi vocale
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FFFF"   # emoji estesi (emoticons, simboli, bandiere, trasporto…)
+    "\U00002600-\U000026FF"   # simboli vari (sole, luna, stelle…)
+    "\U00002700-\U000027BF"   # dingbats
+    "️"                  # variation selector (rende emoji i caratteri precedenti)
+    "‍"                  # zero-width joiner
+    "⃣"                  # combining enclosing keycap
+    "]+",
+    re.UNICODE,
+)
 
 
 def resolve_tts_voice(tts_voice: str) -> str:
@@ -45,6 +59,10 @@ def generate_tts_audio(text: str, voice: str, rate: str = "+0%") -> str:
     Ritorna '' in caso di errore o se edge-tts non è disponibile.
     """
     if not text or not voice:
+        return ""
+
+    text = _EMOJI_RE.sub("", text).strip()
+    if not text:
         return ""
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp3")

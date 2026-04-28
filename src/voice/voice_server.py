@@ -43,10 +43,27 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
+import os
 import re
 import socket
 import threading
+import time
 from typing import TYPE_CHECKING, Callable, Optional
+
+# File di timing: ~/.ltsia/logs/timing.log
+_TIMING_LOG = os.path.expanduser("~/.ltsia/logs/timing.log")
+os.makedirs(os.path.dirname(_TIMING_LOG), exist_ok=True)
+_timing_logger = logging.getLogger("ltsia.timing")
+_timing_logger.setLevel(logging.DEBUG)
+if not _timing_logger.handlers:
+    _fh = logging.FileHandler(_TIMING_LOG, encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    _timing_logger.addHandler(_fh)
+
+def _tlog(msg: str) -> None:
+    print(msg, flush=True)
+    _timing_logger.debug(msg)
 
 import numpy as np
 
@@ -86,6 +103,11 @@ class VoiceServer:
         self._pipeline  = None
         self._notif_queue: Optional[asyncio.Queue] = None
 
+        # Contatori per rate logging messaggi WS in entrata
+        self._ws_msg_count  : int   = 0
+        self._ws_audio_count: int   = 0
+        self._ws_rate_t0    : float = 0.0
+
         # Componenti audio (inizializzati in _serve)
         self._verifier = None
         self._stt      = None
@@ -117,13 +139,30 @@ class VoiceServer:
         self._init_audio_components()
         self._preload_models()
 
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
         try:
-            asyncio.run(self._serve(port))
+            self._loop.run_until_complete(self._serve(port))
         except Exception as e:
             print(f"[voice] Errore server: {e}")
         finally:
-            # Se qualcosa è andato storto prima del set, sblocchiamo comunque il main.
+            try:
+                self._loop.run_until_complete(self._loop.shutdown_default_executor())
+            except Exception:
+                pass
+            self._loop.close()
             self.ready.set()
+
+    def stop(self) -> None:
+        """Ferma il server asyncio dal thread principale."""
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed():
+            return
+        stop_event = getattr(self, "_stop_event_async", None)
+        if stop_event is not None:
+            loop.call_soon_threadsafe(stop_event.set)
+        elif loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
 
     def _preload_models(self) -> None:
         """
@@ -166,17 +205,24 @@ class VoiceServer:
         else:
             print("[voice]   speaker recognition: non disponibile (installa resemblyzer, webrtcvad, faster-whisper)")
 
+        bg_tasks = []
         if self.job_manager:
-            asyncio.create_task(self._poll_job_notifications())
-            asyncio.create_task(self._drain_notifications())
-            asyncio.create_task(self._broadcast_jobs())
+            bg_tasks.append(asyncio.create_task(self._poll_job_notifications()))
+            bg_tasks.append(asyncio.create_task(self._drain_notifications()))
+            bg_tasks.append(asyncio.create_task(self._broadcast_jobs()))
 
+        self._stop_event_async = asyncio.Event()
         async with websockets.serve(self._handle_client, "0.0.0.0", port):
             # Segnala al main thread che il voice server è pronto: STT caricato,
             # verifier pronto, websocket in ascolto. Da qui il REPL può stampare
             # il prompt senza rischio di sovrapposizioni.
             self.ready.set()
-            await asyncio.Future()
+            await self._stop_event_async.wait()
+
+        for t in bg_tasks:
+            t.cancel()
+        if bg_tasks:
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
 
     def _init_audio_components(self) -> None:
         """Istanzia i componenti audio. I modelli vengono caricati lazily."""
@@ -184,8 +230,9 @@ class VoiceServer:
             from src.voice.speaker_verifier import SpeakerVerifier
             from src.voice.stt_engine       import STTEngine
             self._verifier = SpeakerVerifier()
-            model_size     = getattr(self.config, "stt_model", "small")
-            self._stt      = STTEngine(model_size=model_size, language="it")
+            model_size   = getattr(self.config, "stt_model", "small")
+            cpu_threads  = int(getattr(self.config, "stt_cpu_threads", 4))
+            self._stt    = STTEngine(model_size=model_size, language="it", cpu_threads=cpu_threads)
         except Exception as exc:
             print(f"[voice] Audio pipeline non disponibile: {exc}")
             self._verifier = None
@@ -197,8 +244,11 @@ class VoiceServer:
         loop = asyncio.get_event_loop()
         from src.voice.tts import generate_tts_audio
 
-        self._active_ws = websocket
-        self._pipeline  = None
+        self._active_ws      = websocket
+        self._pipeline       = None
+        self._ws_msg_count   = 0
+        self._ws_audio_count = 0
+        self._ws_rate_t0     = time.monotonic()
 
         try:
             # Costruisci pipeline audio se disponibile
@@ -223,6 +273,21 @@ class VoiceServer:
                     continue
 
                 msg_type = msg.get("type", "message")
+
+                # ── Rate logging messaggi WS ───────────────────────────────
+                self._ws_msg_count += 1
+                if msg_type == "audio_chunk":
+                    self._ws_audio_count += 1
+                now_t = time.monotonic()
+                elapsed_t = now_t - self._ws_rate_t0
+                if elapsed_t >= 10.0:
+                    msg_rate   = self._ws_msg_count   / elapsed_t
+                    audio_rate = self._ws_audio_count / elapsed_t
+                    print(f"[ws] rate: {msg_rate:.1f} msg/s | {audio_rate:.1f} audio_chunk/s "
+                          f"({self._ws_msg_count} msg in {elapsed_t:.0f}s)")
+                    self._ws_msg_count   = 0
+                    self._ws_audio_count = 0
+                    self._ws_rate_t0     = now_t
 
                 # ── Chunk audio dal browser ────────────────────────────────
                 if msg_type == "audio_chunk":
@@ -281,7 +346,7 @@ class VoiceServer:
         from src.voice.vad_processor import VADProcessor
         from src.voice.audio_pipeline import AudioPipeline
 
-        vad = VADProcessor(aggressiveness=2)
+        vad = VADProcessor(aggressiveness=3)
 
         async def send_fn(msg: dict) -> None:
             await self._send(websocket, msg)
@@ -314,6 +379,18 @@ class VoiceServer:
         if self._is_busy:
             return
 
+        # ── Timing end-to-end ────────────────────────────────────────────────
+        _t0      = time.monotonic()
+        _pipeline = self._pipeline
+        _t_vad   = _pipeline._t_vad_end if _pipeline is not None else _t0
+
+        def _dt(label: str) -> None:
+            from_vad  = (time.monotonic() - _t_vad) * 1000
+            from_chat = (time.monotonic() - _t0)    * 1000
+            _tlog(f"[timing] +{from_vad:6.0f}ms (chat+{from_chat:5.0f}ms)  {label}")
+
+        _dt("_run_chat avviato (loop asyncio)")
+
         self._is_busy = True
         # Silenzia la pipeline: l'IA sta per parlare, non vogliamo che si ascolti
         if self._pipeline:
@@ -323,18 +400,26 @@ class VoiceServer:
         # ── TTS worker: sintetizza frasi in ordine e le invia al client ──────
         sentence_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
 
+        _first_tts_logged = False
+
         async def tts_worker() -> None:
+            nonlocal _first_tts_logged
             while True:
                 sentence = await sentence_queue.get()
                 if sentence is None:  # sentinel di chiusura
                     return
+                t_tts = time.monotonic()
                 audio_b64 = await loop.run_in_executor(
                     None,
                     lambda s=sentence: generate_tts_audio(
                         s, self._tts_voice, self._tts_rate
                     ),
                 )
+                tts_ms = (time.monotonic() - t_tts) * 1000
                 if audio_b64:
+                    if not _first_tts_logged:
+                        _first_tts_logged = True
+                        _dt(f"primo audio TTS pronto e inviato (sintesi {tts_ms:.0f}ms)")
                     await self._send(websocket, {
                         "type":   "audio",
                         "data":   audio_b64,
@@ -343,40 +428,159 @@ class VoiceServer:
 
         tts_task = asyncio.create_task(tts_worker()) if self._tts_voice else None
 
-        # Boundary frase: punto/esclamativo/domanda seguiti da spazio,
-        # oppure newline. Evita di spezzare "e.g." o numeri decimali.
-        _sent_re = re.compile(r"(?<=[.!?])\s+|\n+")
+        # Boundary frase: punto/esclamativo/domanda seguiti da spazio o fine riga.
+        # Non spezza abbreviazioni come "e.g." o numeri decimali.
+        _sent_re = re.compile(r"(?<=[.!?])[ \t]+|\n+")
+
+        # Stato filtro tool call per il TTS (stateful su più chunk)
+        _tts_hold     = ""   # buffer look-ahead per rilevare tag a cavallo di chunk
+        _tts_in_call  = False
+        _TOPEN        = "<tool_call>"
+        _TCLOSE       = "</tool_call>"
+        _HOLD_LEN     = max(len(_TOPEN), len(_TCLOSE)) - 1
+
         sentence_buf = ""
 
-        def _flush(sentence: str) -> None:
-            sentence = sentence.strip()
+        def _tts_filter(chunk: str) -> str:
+            """Rimuove blocchi <tool_call>…</tool_call> dal testo destinato al TTS."""
+            nonlocal _tts_hold, _tts_in_call
+            _tts_hold += chunk
+            out = ""
+            while _tts_hold:
+                if not _tts_in_call:
+                    idx = _tts_hold.find(_TOPEN)
+                    if idx == -1:
+                        # Nessun tag aperto: emetti tutto tranne gli ultimi N char
+                        # (potrebbero essere l'inizio di un tag)
+                        safe = len(_tts_hold) - _HOLD_LEN
+                        if safe > 0:
+                            out += _tts_hold[:safe]
+                            _tts_hold = _tts_hold[safe:]
+                        break
+                    out += _tts_hold[:idx]
+                    _tts_hold = _tts_hold[idx + len(_TOPEN):]
+                    _tts_in_call = True
+                else:
+                    idx = _tts_hold.find(_TCLOSE)
+                    if idx == -1:
+                        # Dentro un tool call: scarta tutto tranne la coda
+                        safe = len(_tts_hold) - _HOLD_LEN
+                        if safe > 0:
+                            _tts_hold = _tts_hold[safe:]
+                        break
+                    _tts_hold = _tts_hold[idx + len(_TCLOSE):]
+                    _tts_in_call = False
+            return out
+
+        def _tts_flush_hold() -> str:
+            """Emette i char rimasti nel buffer look-ahead a fine streaming."""
+            nonlocal _tts_hold, _tts_in_call
+            out = "" if _tts_in_call else _tts_hold
+            _tts_hold = ""
+            _tts_in_call = False
+            return out
+
+        def _clean_for_tts(text: str) -> str:
+            """Rimuove formattazione markdown e simboli speciali prima del TTS."""
+            # Cattura i gruppi (testo nei link, bold, italic) e li mantiene
+            text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+            text = re.sub(r"`([^`]*)`", r"\1", text)
+            text = re.sub(r"\*{1,3}([^*\n]*?)\*{1,3}", r"\1", text)
+            text = re.sub(r"_{1,3}([^_\n]*?)_{1,3}", r"\1", text)
+            text = re.sub(r"~{2}([^~]*?)~{2}", r"\1", text)
+            text = re.sub(r"#{1,6}\s*", "", text)
+            text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
+            text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+            text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+            text = re.sub(r"^\s*>\s*", "", text, flags=re.MULTILINE)
+            text = re.sub(r"[|]{1}", " ", text)
+            text = re.sub(r"^[-=]{2,}\s*$", "", text, flags=re.MULTILINE)
+            # Simboli residui che il TTS legge letteralmente
+            text = re.sub(r"[*_~`#\\]", "", text)
+            # Spazi multipli/newline in eccesso
+            text = re.sub(r"\n{2,}", " ", text)
+            text = re.sub(r"\s{2,}", " ", text)
+            return text.strip()
+
+        def _enqueue_sentence(sentence: str) -> None:
+            sentence = _clean_for_tts(sentence.strip())
             if not sentence or tts_task is None:
                 return
-            asyncio.run_coroutine_threadsafe(
-                sentence_queue.put(sentence), loop
-            )
+            asyncio.run_coroutine_threadsafe(sentence_queue.put(sentence), loop)
+
+        _first_chunk_logged = False
 
         def on_chunk(chunk: str) -> None:
-            nonlocal sentence_buf
-            # Inoltra il chunk testuale subito (il client aggiorna la UI)
+            nonlocal sentence_buf, _first_chunk_logged
+            if not _first_chunk_logged:
+                _first_chunk_logged = True
+                _dt("primo chunk LLM ricevuto")
+            # Invia il chunk grezzo al client per aggiornare la UI
             asyncio.run_coroutine_threadsafe(
                 self._send(websocket, {"type": "chunk", "text": chunk}),
                 loop,
             )
-            sentence_buf += chunk
-            # Estrae tutte le frasi complete disponibili
+            # Filtra i blocchi tool call prima di passare al TTS
+            tts_text = _tts_filter(chunk)
+            sentence_buf += tts_text
+            # Estrae frasi complete e le manda al worker TTS
             while True:
                 m = _sent_re.search(sentence_buf)
                 if not m:
                     break
                 end = m.end()
                 sentence, sentence_buf = sentence_buf[:end], sentence_buf[end:]
-                _flush(sentence)
+                _enqueue_sentence(sentence)
 
+        _TOOL_ANNOUNCE = {
+            "web_search":             lambda a: f"Cerco {a.get('query', '')}.",
+            "web_fetch":              lambda a: "Leggo la pagina.",
+            "execute_command":        lambda a: f"Eseguo: {str(a.get('command',''))[:60]}.",
+            "write_file":             lambda a: f"Scrivo il file {a.get('path', a.get('filename',''))}.",
+            "read_file":              lambda a: f"Leggo il file {a.get('path', a.get('filename',''))}.",
+            "create_directory":       lambda a: f"Creo la cartella {a.get('path','')}.",
+            "list_directory":         lambda a: "Elenco i file.",
+            "glob_search":            lambda a: f"Cerco file con pattern {a.get('pattern','')}.",
+            "grep_search":            lambda a: f"Cerco nel codice: {a.get('pattern','')}.",
+            "plan_project":           lambda a: "Pianificando il progetto.",
+            "delegate_file_creation": lambda a: "Genero i file.",
+            "run_tests":              lambda a: "Eseguo i test.",
+            "smart_install":          lambda a: f"Installo {a.get('packages', a.get('package',''))}.",
+            "create_module":          lambda a: f"Creo il modulo {a.get('name','')}.",
+            "remember":               lambda a: "Salvo in memoria.",
+            "search_memory":          lambda a: f"Cerco in memoria: {a.get('query','')}.",
+            "screenshot":             lambda a: "Scatto uno screenshot.",
+            "applescript":            lambda a: "Eseguo uno script.",
+            "schedule_job":           lambda a: "Programmo un job.",
+        }
+
+        def _tool_announcement(tool_name: str, args: dict) -> str:
+            fn = _TOOL_ANNOUNCE.get(tool_name)
+            if fn:
+                try:
+                    return fn(args)
+                except Exception:
+                    pass
+            return f"Uso {tool_name.replace('_', ' ')}."
+
+        def on_tool_start(tool_name: str, args: dict) -> None:
+            _dt(f"tool '{tool_name}' avviato")
+            asyncio.run_coroutine_threadsafe(
+                self._send(websocket, {"type": "tool", "name": tool_name}),
+                loop,
+            )
+            if self._tts_voice:
+                announcement = _tool_announcement(tool_name, args)
+                asyncio.run_coroutine_threadsafe(
+                    sentence_queue.put(announcement),
+                    loop,
+                )
+
+        _dt("run_in_executor avviato → chat_agent.chat()")
         try:
             response: str = await loop.run_in_executor(
                 None,
-                lambda t=text: self.chat_agent.chat(t, on_stream=on_chunk),
+                lambda t=text: self.chat_agent.chat(t, on_stream=on_chunk, on_tool_start=on_tool_start),
             )
         except Exception as exc:
             if tts_task is not None:
@@ -389,16 +593,22 @@ class VoiceServer:
                 self._pipeline.set_deaf(False)
             return
 
-        # Flush della coda residua (ultima frase senza terminatore)
-        if sentence_buf.strip():
-            _flush(sentence_buf)
-            sentence_buf = ""
+        # Flush residuo: l'ultima frase potrebbe non avere terminatore finale.
+        # Va messo in coda con await diretto PRIMA del sentinel None, altrimenti
+        # run_coroutine_threadsafe la schedula dopo che il worker ha già ricevuto
+        # None e terminato.
+        # Svuota anche il buffer look-ahead del filtro tag (ultimi _HOLD_LEN char
+        # trattenuti per prevenire false aperture di tag a cavallo di chunk).
+        residual = (sentence_buf + _tts_flush_hold()).strip()
+        sentence_buf = ""
 
-        # Attende che il worker abbia finito di inviare tutto l'audio
         if tts_task is not None:
-            await sentence_queue.put(None)
+            if residual:
+                await sentence_queue.put(residual)
+            await sentence_queue.put(None)   # sentinel di chiusura
             await tts_task
 
+        _dt("LLM completato, risposta intera pronta")
         await self._send(websocket, {"type": "done", "full": response})
         await self._send_stats(websocket)
         self._is_busy = False

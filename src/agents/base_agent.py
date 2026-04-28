@@ -28,6 +28,7 @@ class BaseAgent:
         context: ContextManager,
         tool_schemas: list[dict],
         on_stream: Optional[Callable[[str], None]] = None,
+        on_tool_start: Optional[Callable[[str, dict], None]] = None,
         max_iterations: Optional[int] = None,
     ) -> str:
         """Loop agente PTC: chiama LLM → esegui tool → ripeti."""
@@ -78,6 +79,12 @@ class BaseAgent:
                     args = json.loads(args_str) if isinstance(args_str, str) else args_str
                 except json.JSONDecodeError:
                     args = {}
+
+                if on_tool_start:
+                    try:
+                        on_tool_start(tool_name, args)
+                    except Exception:
+                        pass
 
                 tool_result = self.registry.execute(tool_name, args)
                 tool_results.append({
