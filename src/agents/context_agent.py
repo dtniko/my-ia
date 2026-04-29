@@ -18,11 +18,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
-from src.memory.permanent_memory import PermanentMemory
 from src.ui.cli import CLI
 
 if TYPE_CHECKING:
+    from src.memory.core_facts import CoreFactsMemory
     from src.memory.semantic_memory import SemanticMemory
+    from src.memory.qdrant_memory import QdrantMemory
 
 
 # ── Token budget ──────────────────────────────────────────────────────────────
@@ -65,8 +66,9 @@ class ContextAgent:
 
     def __init__(
         self,
-        permanent_memory: PermanentMemory,
+        permanent_memory: Optional["CoreFactsMemory"] = None,
         semantic_memory: Optional["SemanticMemory"] = None,
+        qdrant_memory: Optional["QdrantMemory"] = None,
         warn_tokens: int = 6000,
         max_tokens: int = 8000,
         semantic_results: int = 10,
@@ -74,6 +76,7 @@ class ContextAgent:
     ):
         self.permanent_memory = permanent_memory
         self.semantic_memory = semantic_memory
+        self.qdrant_memory = qdrant_memory
         self.warn_tokens = warn_tokens
         self.max_tokens = max_tokens
         self.semantic_results = semantic_results
@@ -90,11 +93,15 @@ class ContextAgent:
         """
         query = session_hint.strip() or "LTSIA sessione generale"
 
-        # 1. Memorie semantiche rilevanti
+        # 1. Memorie semantiche rilevanti: preferenza Qdrant, fallback semantic_memory legacy
         semantic_hits: list[dict] = []
-        if self.semantic_memory:
+        active_semantic = (
+            self.qdrant_memory if (self.qdrant_memory and self.qdrant_memory.is_ready())
+            else self.semantic_memory
+        )
+        if active_semantic:
             try:
-                semantic_hits = self.semantic_memory.search(
+                semantic_hits = active_semantic.search(
                     query,
                     limit=self.semantic_results,
                     threshold=self.semantic_threshold,
@@ -102,8 +109,8 @@ class ContextAgent:
             except Exception as e:
                 CLI.warning(f"ContextAgent: ricerca semantica fallita: {e}")
 
-        # 2. Memorie permanenti
-        permanent_hits = self.permanent_memory.get_all()
+        # 2. Fatti core (sempre inclusi)
+        permanent_hits = self.permanent_memory.get_all() if self.permanent_memory else []
 
         # 3. Assembla testo contesto
         text = self._assemble(semantic_hits, permanent_hits)

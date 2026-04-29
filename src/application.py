@@ -15,7 +15,7 @@ from src.http.openai_client import OpenAIClient
 from src.http.ptc_adapter import PTCAdapter
 from src.tools.tool_registry import ToolRegistry
 from src.tools.create_module import CreateModuleTool, ReloadModuleTool, ListModulesTool
-from src.memory.permanent_memory import PermanentMemory
+from src.memory.core_facts import CoreFactsMemory
 from src.memory.short_term import ShortTermMemory
 from src.memory.medium_term import MediumTermMemory
 from src.memory.qdrant_memory import QdrantMemory
@@ -26,6 +26,7 @@ from src.agents.memory_orchestrator_agent import MemoryOrchestratorAgent
 from src.agents.memory_reader_agent import MemoryReaderAgent
 from src.agents.memory_searcher_agent import MemorySearcherAgent
 from src.agents.memory_optimizer_agent import MemoryOptimizerAgent
+from src.memory.promotion_service import PromotionService
 from src.agents.project_manager_agent import ProjectManagerAgent
 from src.agents.execution_agent import ExecutionAgent
 from src.agents.testing_agent import TestingAgent
@@ -46,7 +47,7 @@ class Application:
         self.openai = PTCAdapter(OpenAIClient(config.exec_base_url))
 
         CLI.step("Inizializzazione memoria...")
-        self.memory = PermanentMemory()
+        self.memory = CoreFactsMemory()
         self.semantic_memory = None          # legacy SQLite (fallback)
         self.qdrant_memory = None            # long-term Qdrant
         self.qdrant_lifecycle = None         # gestore avvio/spegnimento Qdrant
@@ -74,10 +75,21 @@ class Application:
         self.registry.register(ReloadModuleTool(self.registry, self.extensions_dir))
         self.registry.register(ListModulesTool(self.registry, self.extensions_dir))
 
-        # Registra tool memoria semantica: preferenza Qdrant, fallback SemanticMemory legacy
+        # Aggiorna tool memoria con tutti i riferimenti ora disponibili
+        self.registry.register_memory_tools(
+            core_facts=self.memory,
+            qdrant_memory=self.qdrant_memory if (self.qdrant_memory and self.qdrant_memory.is_ready()) else None,
+            medium_term=self.medium_term,
+        )
+
+        # Registra search_memory (ricerca semantica)
         active_semantic = self.qdrant_memory if (self.qdrant_memory and self.qdrant_memory.is_ready()) else self.semantic_memory
         if active_semantic:
             self.registry.register_semantic_memory(active_semantic)
+
+        # Inietta il client Qdrant nel viz tool (necessario in qdrant_mode=local)
+        if self.qdrant_memory and self.qdrant_memory.is_ready():
+            self.registry.register_qdrant_memory(self.qdrant_memory)
 
         # Job manager
         self.job_manager = self._init_job_manager()
@@ -88,6 +100,7 @@ class Application:
         self.context_agent = ContextAgent(
             permanent_memory=self.memory,
             semantic_memory=self.semantic_memory,
+            qdrant_memory=self.qdrant_memory,
             warn_tokens=config.context_initial_warn_tokens,
             max_tokens=config.context_initial_max_tokens,
         )
@@ -104,18 +117,20 @@ class Application:
         Path(self.config.work_dir).mkdir(parents=True, exist_ok=True)
 
     def _ensure_qdrant_running(self):
-        """Avvia Qdrant locale se non già in ascolto. Il processo figlio viene
-        terminato all'uscita (atexit) solo se lo abbiamo spawnato noi."""
+        """Avvia Qdrant locale se non già in ascolto.
+        In modalità 'local' salta il lifecycle: il client usa storage embedded."""
         cfg = self.config
         if not cfg.embedding_host:
             return
+        if getattr(cfg, "qdrant_mode", "server") == "local":
+            return  # nessun server da avviare
         lifecycle = QdrantLifecycle(cfg.qdrant_host, cfg.qdrant_port)
         ok, status = lifecycle.start_if_needed()
         self.qdrant_lifecycle = lifecycle
         if status == "started" and ok:
             CLI.success(f"Qdrant avviato (PID {lifecycle.process.pid}) su {cfg.qdrant_url}")
         elif status == "already":
-            pass  # già attivo: niente rumore, _init_qdrant_memory stamperà il successo
+            pass
         elif status == "missing":
             CLI.warning(
                 f"Binario Qdrant non trovato in ~/.ltsia/qdrant/qdrant — "
@@ -139,6 +154,7 @@ class Application:
                 model=cfg.embedding_model,
                 api_type=getattr(cfg, "embedding_api", "ollama"),
             )
+            qdrant_mode = getattr(cfg, "qdrant_mode", "server")
             qm = QdrantMemory(
                 host=cfg.qdrant_host,
                 port=cfg.qdrant_port,
@@ -146,17 +162,24 @@ class Application:
                 vector_size=cfg.qdrant_vector_size,
                 embedder=embedder,
                 dedup_threshold=cfg.memory_dedup_threshold,
+                mode=qdrant_mode,
             )
             if qm.is_ready():
                 self.qdrant_memory = qm
-                CLI.success(
-                    f"Qdrant memoria lungo termine: {cfg.qdrant_url} "
-                    f"(collection '{cfg.qdrant_collection}', dashboard {cfg.qdrant_url}/dashboard)"
-                )
+                if qdrant_mode == "local":
+                    CLI.success(
+                        f"Qdrant memoria lungo termine: modalità locale "
+                        f"(~/.ltsia/qdrant/storage, collection '{cfg.qdrant_collection}')"
+                    )
+                else:
+                    CLI.success(
+                        f"Qdrant memoria lungo termine: {cfg.qdrant_url} "
+                        f"(collection '{cfg.qdrant_collection}', dashboard {cfg.qdrant_url}/dashboard)"
+                    )
             else:
                 CLI.warning(
-                    f"Qdrant non raggiungibile su {cfg.qdrant_url} — "
-                    f"avvia con ~/.ltsia/qdrant/start.sh oppure disabilita in ltsia.ini"
+                    f"Qdrant non inizializzato — "
+                    f"verifica qdrant_mode in ltsia.ini (server|local)"
                 )
         except Exception as e:
             CLI.warning(f"Qdrant non inizializzato: {e}")
@@ -217,6 +240,22 @@ class Application:
             web_fallback_threshold=cfg.memory_web_fallback_threshold,
         )
         CLI.success("MemoryOrchestrator pronto (short + medium + long + web fallback)")
+
+        # PromotionService: promuove voci medium → Qdrant prima della scadenza (48h)
+        self.promotion_service = None
+        if self.medium_term and self.qdrant_memory and self.qdrant_memory.is_ready():
+            try:
+                self.promotion_service = PromotionService(
+                    medium_term=self.medium_term,
+                    qdrant_memory=self.qdrant_memory,
+                    llm_client=self.openai,
+                    llm_model=cfg.exec_model,
+                    verbose=cfg.verbose,
+                )
+                self.promotion_service.start_background()
+                CLI.success("PromotionService avviato (medium → Qdrant ogni 30 min)")
+            except Exception as e:
+                CLI.warning(f"PromotionService non avviato: {e}")
 
     def _wire_memory_orchestrator(self):
         """Attacca l'orchestratore al ChatAgent con hook pre/post-turn."""
@@ -428,11 +467,6 @@ class Application:
 
         self._voice_port = 8765
         voice_status = self._start_voice_background(self._voice_port)
-        viz_url = self._start_qdrant_viz_background(8090)
-        self._viz_url = viz_url or ""
-        if viz_url:
-            CLI.success(f"Qdrant Viz: {viz_url}")
-        atexit.register(self._stop_qdrant_viz)
 
         optimizer_status = self._start_memory_optimizer_background()
         if optimizer_status:
@@ -458,30 +492,7 @@ class Application:
             vs = getattr(self, "_voice_server", None)
             if vs is not None:
                 vs.stop()
-            self._stop_qdrant_viz()
             self._stop_memory_optimizer()
-
-    def _start_qdrant_viz_background(self, port: int = 8090) -> str:
-        """Avvia il server Qdrant Viz in background. Ritorna URL o '' se non avviato."""
-        if not (self.qdrant_memory and self.qdrant_memory.is_ready()):
-            return ""
-        try:
-            from src.tools.qdrant_viz.viz_tool import QdrantVizTool
-            result = QdrantVizTool(self.config).execute({"action": "start", "port": port})
-        except Exception as e:
-            CLI.warning(f"Qdrant Viz non avviato: {e}")
-            return ""
-        if result.startswith("ERROR"):
-            CLI.warning(f"Qdrant Viz non avviato: {result}")
-            return ""
-        return f"http://127.0.0.1:{port}"
-
-    def _stop_qdrant_viz(self):
-        try:
-            from src.tools.qdrant_viz.viz_tool import QdrantVizTool
-            QdrantVizTool(self.config).execute({"action": "stop"})
-        except Exception:
-            pass
 
     def _start_memory_optimizer_background(self) -> str:
         """Avvia il MemoryOptimizerAgent in background. Ritorna label status o ''."""
@@ -517,6 +528,12 @@ class Application:
         if agent:
             try:
                 agent.stop()
+            except Exception:
+                pass
+        ps = getattr(self, "promotion_service", None)
+        if ps:
+            try:
+                ps.stop()
             except Exception:
                 pass
 
@@ -643,11 +660,20 @@ class Application:
             context_window=self.config.context_window,
         )
 
+        qdrant_viz_backend = None
+        if self.qdrant_memory and self.qdrant_memory.is_ready():
+            try:
+                from src.tools.qdrant_viz.viz_tool import build_backend
+                qdrant_viz_backend = build_backend(self.config, self.qdrant_memory)
+            except Exception:
+                pass
+
         server = VoiceServer(
             voice_agent,
             self.config,
             job_manager=self.job_manager,
             snapshot_provider=self.build_snapshot,
+            qdrant_viz_backend=qdrant_viz_backend,
         )
         t = threading.Thread(target=server.run, args=(port,), daemon=True)
         t.start()
@@ -657,6 +683,8 @@ class Application:
         # e sia in ascolto. Timeout generoso per CPU lente.
         if not server.ready.wait(timeout=120):
             CLI.warning("Voice server: timeout 120s sull'avvio — continuo con REPL")
+
+        server.print_startup_banner()
 
         tts_voice = resolve_tts_voice(self.config.tts_voice)
         label = f"ws://localhost:{port}"

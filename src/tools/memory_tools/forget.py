@@ -1,33 +1,70 @@
+"""ForgetTool — rimuove voci dalla memoria (core o Qdrant)."""
 from __future__ import annotations
-import json
-from pathlib import Path
+from typing import TYPE_CHECKING
 from ..base_tool import BaseTool
+
+if TYPE_CHECKING:
+    from src.memory.core_facts import CoreFactsMemory
+    from src.memory.qdrant_memory import QdrantMemory
 
 
 class ForgetTool(BaseTool):
+    def __init__(
+        self,
+        core_facts: "CoreFactsMemory",
+        qdrant_memory: "QdrantMemory | None" = None,
+    ):
+        self.core = core_facts
+        self.qdrant = qdrant_memory
+
     def get_name(self): return "forget"
-    def get_description(self): return "Rimuove una voce dalla memoria permanente per ID."
+
+    def get_description(self):
+        return (
+            "Rimuove una voce dalla memoria. "
+            "Usa tier='core' + id numerico per i fatti core; "
+            "tier='long' + id (UUID stringa) per Qdrant."
+        )
+
     def get_parameters(self):
         return {
             "type": "object",
-            "properties": {"id": {"type": "integer", "description": "ID della memoria da rimuovere"}},
+            "properties": {
+                "id": {
+                    "description": "ID della memoria (int per core, UUID string per long)",
+                },
+                "tier": {
+                    "type": "string",
+                    "enum": ["core", "long"],
+                    "description": "Livello da cui rimuovere (default: core)",
+                    "default": "core",
+                },
+            },
             "required": ["id"],
         }
 
     def execute(self, args: dict) -> str:
+        tier = args.get("tier", "core")
         mem_id = args.get("id")
         if mem_id is None:
             return "ERROR: id obbligatorio"
-        mem_file = Path.home() / ".ltsia" / "memory.json"
-        if not mem_file.exists():
-            return "ERROR: nessuna memoria trovata"
-        try:
-            data = json.loads(mem_file.read_text())
-            before = len(data["entries"])
-            data["entries"] = [e for e in data["entries"] if e["id"] != int(mem_id)]
-            if len(data["entries"]) == before:
-                return f"ERROR: nessuna memoria con id={mem_id}"
-            mem_file.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-            return f"Memoria id={mem_id} rimossa"
-        except Exception as e:
-            return f"ERROR: {e}"
+
+        if tier == "core":
+            try:
+                idx = int(mem_id)
+            except (ValueError, TypeError):
+                return "ERROR: id deve essere un intero per tier=core"
+            if self.core.remove(idx):
+                return f"Rimosso dai fatti core (#{idx})"
+            return f"ERROR: nessun fatto core con id={idx}"
+
+        if tier == "long":
+            if not (self.qdrant and self.qdrant.is_ready()):
+                return "ERROR: Qdrant non disponibile"
+            try:
+                self.qdrant.delete(str(mem_id))
+                return f"Rimosso da Qdrant (id={mem_id})"
+            except Exception as e:
+                return f"ERROR Qdrant: {e}"
+
+        return f"ERROR: tier sconosciuto '{tier}'"

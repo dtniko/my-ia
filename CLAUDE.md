@@ -61,10 +61,37 @@ browser/     → browser_test, dev_server_manager, start_dev_server, stop_dev_se
 jobs_tools/  → cancel_job, list_jobs, schedule_job
 ```
 
-### Memoria
-- **Permanente** (`src/memory/permanent_memory.py`) — key-value persistente su disco
-- **Semantica** (`src/memory/semantic_memory.py`) — vettoriale via embedding (opzionale, richiede `embedding_host` in config)
-- Embedding: `nomic-embed-text` via Ollama, SQLite locale in `~/.ltsia/semantic_memory.db`
+### Memoria (tre livelli)
+| Livello | File | TTL | Uso |
+|---|---|---|---|
+| **Core** | `src/memory/core_facts.py` → `~/.ltsia/core_facts.md` | ∞ | Iniettato sempre in ogni prompt (nome IA, nome utente, preferenze fisse) |
+| **Medio** | `src/memory/medium_term.py` → `~/.ltsia/memory_medium.db` | 48h | Contesto sessione, eventi recenti; promozione automatica → Qdrant |
+| **Lungo** | `src/memory/qdrant_memory.py` → `~/.ltsia/qdrant/storage` | ∞ | Fatti persistenti, ricerca semantica vettoriale (Qdrant embedded, `qdrant_mode=local`) |
+
+#### Routing `remember` tool (`tier=auto/core/long/medium`)
+- `core` — identità, nome, preferenze fisse sempre valide → `core_facts.md`
+- `long` — fatti persistenti, pattern ricorrenti, preferenze consolidate → Qdrant
+- `medium` — contesto di sessione, eventi recenti, stato temporaneo → SQLite 48h
+- `auto` (default) — euristica su parole chiave: "mi chiamo/preferisco/sono" → core; "oggi/sto lavorando" → medium; tutto il resto → long
+
+#### Promotion pipeline (medium → Qdrant)
+`src/memory/promotion_service.py` — thread daemon ogni 30 min:
+1. Trova room in scadenza entro 12h
+2. LLM valuta: "è utile oltre questa sessione?"
+3. Se sì → salva in Qdrant con metadata wing/hall/room
+4. Esegue `expire_stale()` per pulizia
+
+#### Viz Qdrant (frontend)
+Il pannello `/viz` nel frontend React usa **WebSocket** (porta 8765) verso `voice_server.py`.
+In `qdrant_mode=local` usa `_LocalVizBackend` (qdrant_client embedded, nessuna porta HTTP aggiuntiva).
+Il binario Qdrant standalone **non funziona** su RPi5 (jemalloc incompatibile con page size 16KB).
+
+#### Iniezione contesto per prompt
+Ad ogni prompt: `core_facts.md` (sempre) + top-K hit Qdrant + top-K hit medium-term rilevanti per il testo del prompt corrente (gestito da `MemoryOrchestratorAgent.enrich_request()`).
+
+- Embedding: `nomic-embed-text` via Ollama (`192.168.250.203:11434`)
+- `list_memories` / `forget` supportano tutti e tre i livelli
+- `search_memory` — ricerca semantica su Qdrant (o legacy SQLite come fallback)
 
 ### Job Manager (`src/jobs/`)
 Job asincroni persistenti salvati in `~/.ltsia/jobs/`. Componenti: `job.py`, `job_store.py`, `job_worker.py`, `job_manager.py`.

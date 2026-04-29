@@ -3,16 +3,17 @@ import { useWebSocket }   from './hooks/useWebSocket.js'
 import { useSpeech }      from './hooks/useSpeech.js'
 import { useElevenLabs }  from './hooks/useElevenLabs.js'
 import { useAudioStream } from './hooks/useAudioStream.js'
-import { AiFace }         from './components/AiFace.jsx'
-import { SidePanel }      from './components/SidePanel.jsx'
-import { QdrantPanel }    from './components/QdrantPanel.jsx'
+import { AiFace }       from './components/AiFace.jsx'
+import { SidePanel }    from './components/SidePanel.jsx'
+import { QdrantPanel }  from './components/QdrantPanel.jsx'
+import { ConfigPanel }  from './components/ConfigPanel.jsx'
 import { ChatMessage, StreamingMessage } from './components/ChatMessage.jsx'
 
 const DEFAULT_WS_URL = `ws://${window.location.hostname}:8765`
 
 export default function App() {
   // ── Connection ─────────────────────────────────────────────────────────────
-  const [wsUrl, setWsUrl]           = useState(DEFAULT_WS_URL)
+  const [wsUrl, setWsUrl]           = useState(() => localStorage.getItem('ws_url') || DEFAULT_WS_URL)
   const [appState, setAppState]     = useState('disconnected')
   const [error, setError]           = useState(null)
 
@@ -45,8 +46,10 @@ export default function App() {
   const [jobLogsLive, setJobLogsLive] = useState(null)
 
   // ── UI state ───────────────────────────────────────────────────────────────
-  const [showDebug, setShowDebug]   = useState(false)
-  const [showChat,  setShowChat]    = useState(false)
+  const [showDebug,      setShowDebug]      = useState(false)
+  const [showChat,       setShowChat]       = useState(false)
+  const [chatMaximized,  setChatMaximized]  = useState(false)
+  const [showConfig,     setShowConfig]     = useState(false)
 
   // ── ElevenLabs ─────────────────────────────────────────────────────────────
   const [elKey,     setElKey]     = useState(() => localStorage.getItem('el_key')      ?? '')
@@ -234,6 +237,20 @@ export default function App() {
     setSpeakerPaused(false); setIsConfirming(false); setIsEnrolling(false)
   }, [speech, eleven, ws])
 
+  const handleApplyConfig = useCallback((newUrl) => {
+    setWsUrl(newUrl)
+    clearTimeout(reconnectTimer.current)
+    speech.cancelSpeech(); eleven.cancelSpeech()
+    if (serverAudioRef.current) { serverAudioRef.current.pause(); serverAudioRef.current = null }
+    ws.disconnect()
+    setAppState('disconnected')
+    // connect con il nuovo URL
+    setTimeout(() => {
+      ws.connect(newUrl)
+      setAppState('idle')
+    }, 200)
+  }, [speech, eleven, ws])
+
   // Keep ref current for reconnect timer closure
   connectRef.current = connect
 
@@ -304,7 +321,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem('el_voice_id', elVoiceId) }, [elVoiceId])
 
   // ── Derived: qdrant viz URL from snapshot ──────────────────────────────────
-  const qdrantVizUrl = snapshot?.links?.find(l => l.label === 'Qdrant Viz')?.url || null
+  // qdrant viz ora integrata su /viz — nessun URL esterno necessario
 
   // ── Status label ──────────────────────────────────────────────────────────
   const statusLabel = () => {
@@ -427,27 +444,35 @@ export default function App() {
       />
 
       {/* ── Qdrant viz panel ── */}
-      <QdrantPanel vizUrl={qdrantVizUrl} />
+      <QdrantPanel />
 
       {/* ── Bottom-left controls ── */}
       <div className="bottom-left-btns">
         <button className="debug-toggle" onClick={() => window.location.reload()} title="Ricarica applicazione">
           ↺ reload
         </button>
-        <button className="debug-toggle" onClick={() => { setShowChat(c => !c); setShowDebug(false) }} title="Chat testuale">
+        <button className="debug-toggle" onClick={() => { setShowChat(c => !c); setShowDebug(false); setShowConfig(false) }} title="Chat testuale">
           {showChat ? '✕ chat' : '💬 chat'}
         </button>
-        <button className="debug-toggle" onClick={() => { setShowDebug(d => !d); setShowChat(false) }} title="Debug / Impostazioni">
-          {showDebug ? '✕ debug' : '⚙ debug'}
+        <button className="debug-toggle" onClick={() => { setShowConfig(c => !c); setShowDebug(false); setShowChat(false) }} title="Configurazione endpoint">
+          {showConfig ? '✕ config' : '⚙ config'}
+        </button>
+        <button className="debug-toggle" onClick={() => { setShowDebug(d => !d); setShowChat(false); setShowConfig(false) }} title="Debug">
+          {showDebug ? '✕ debug' : '🛠 debug'}
         </button>
       </div>
 
       {/* ── Chat panel ── */}
       {showChat && (
-        <div className="chat-panel">
+        <div className={`chat-panel${chatMaximized ? ' chat-panel-maximized' : ''}`}>
           <div className="chat-panel-hdr">
             <span className="chat-panel-title">CHAT</span>
-            <button className="debug-close" onClick={() => setShowChat(false)}>✕</button>
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button className="debug-close" onClick={() => setChatMaximized(m => !m)} title={chatMaximized ? 'Riduci' : 'Massimizza'}>
+                {chatMaximized ? '⊡' : '⊞'}
+              </button>
+              <button className="debug-close" onClick={() => { setShowChat(false); setChatMaximized(false) }}>✕</button>
+            </div>
           </div>
 
           <div className="chat-panel-messages">
@@ -491,6 +516,16 @@ export default function App() {
             >▶</button>
           </div>
         </div>
+      )}
+
+      {/* ── Config panel ── */}
+      {showConfig && (
+        <ConfigPanel
+          wsUrl={wsUrl}
+          onApply={handleApplyConfig}
+          onClose={() => setShowConfig(false)}
+          isConnected={isConnected}
+        />
       )}
 
       {/* ── Debug overlay ── */}

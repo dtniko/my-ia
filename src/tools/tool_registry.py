@@ -92,12 +92,14 @@ class ToolRegistry:
             except Exception:
                 pass
 
-        # Tool memoria base
+        # Tool memoria base — inizializzati senza memorie, aggiornati via register_memory_tools()
         try:
             from .memory_tools.remember import RememberTool
             from .memory_tools.forget import ForgetTool
             from .memory_tools.list_memories import ListMemoriesTool
-            for t in [RememberTool(), ForgetTool(), ListMemoriesTool()]:
+            from src.memory.core_facts import CoreFactsMemory
+            _core = CoreFactsMemory()
+            for t in [RememberTool(_core), ForgetTool(_core), ListMemoriesTool(_core)]:
                 self.register(t)
         except Exception:
             pass
@@ -105,7 +107,29 @@ class ToolRegistry:
         # Tool Qdrant Viz (interfaccia web 3D per esplorare la memoria vettoriale)
         try:
             from .qdrant_viz.viz_tool import QdrantVizTool
-            self.register(QdrantVizTool(self.config))
+            self.register(QdrantVizTool(self.config))  # qdrant_memory aggiunto dopo via register_qdrant_memory
+        except Exception:
+            pass
+
+    def register_memory_tools(self, core_facts, qdrant_memory=None, medium_term=None) -> None:
+        """Aggiorna i tool memoria con i riferimenti alle istanze di memoria."""
+        try:
+            from .memory_tools.remember import RememberTool
+            from .memory_tools.forget import ForgetTool
+            from .memory_tools.list_memories import ListMemoriesTool
+            self.register(RememberTool(core_facts, qdrant_memory, medium_term))
+            self.register(ForgetTool(core_facts, qdrant_memory))
+            self.register(ListMemoriesTool(core_facts, qdrant_memory, medium_term))
+        except Exception:
+            pass
+
+    def register_qdrant_memory(self, qdrant_memory) -> None:
+        """Aggiorna QdrantVizTool con il client locale (necessario in qdrant_mode=local)."""
+        try:
+            from .qdrant_viz.viz_tool import QdrantVizTool
+            tool = self._tools.get("qdrant_viz")
+            if tool and isinstance(tool, QdrantVizTool):
+                tool.qdrant_memory = qdrant_memory
         except Exception:
             pass
 

@@ -295,12 +295,18 @@ class MediumTermMemory:
         return [dict(r) for r in rows]
 
     def expire_stale(self) -> int:
-        """Rimuove i room non toccati da più di ttl_days. Ritorna count."""
+        """Rimuove i room scaduti (non toccati da ttl_days). Ritorna count."""
         cutoff = (datetime.now() - timedelta(days=self.ttl_days)).isoformat()
         c = self._db()
+        # aggiungi colonna promoted se non esiste (migration)
+        try:
+            c.execute("ALTER TABLE rooms ADD COLUMN promoted INTEGER DEFAULT 0")
+            c.commit()
+        except Exception:
+            pass
         rows = c.execute(
-            "SELECT id FROM rooms WHERE last_access < ? AND access_count < ?",
-            (cutoff, self.promote_threshold),
+            "SELECT id FROM rooms WHERE last_access < ?",
+            (cutoff,),
         ).fetchall()
         ids = [r["id"] for r in rows]
         for rid in ids:
@@ -310,6 +316,25 @@ class MediumTermMemory:
             c.execute("DELETE FROM rooms WHERE id = ?", (rid,))
         c.commit()
         return len(ids)
+
+    def recent_drawers(self, limit: int = 20) -> list[dict]:
+        """Ultimi drawer inseriti con gerarchia wing/hall/room."""
+        with self._lock:
+            c = self._db()
+            rows = c.execute(
+                """
+                SELECT d.content, d.created_at,
+                       r.name AS room, h.name AS hall, w.name AS wing
+                FROM drawers d
+                JOIN rooms r ON r.id = d.room_id
+                JOIN halls h ON h.id = r.hall_id
+                JOIN wings w ON w.id = h.wing_id
+                ORDER BY d.created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def stats(self) -> dict:
         c = self._db()

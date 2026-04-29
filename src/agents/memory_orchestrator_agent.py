@@ -22,7 +22,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from src.memory.permanent_memory import PermanentMemory
 from src.ui.cli import CLI
 
 
@@ -61,7 +60,7 @@ class EnrichedContext:
 class MemoryOrchestratorAgent:
     def __init__(
         self,
-        permanent_memory: PermanentMemory,
+        permanent_memory=None,   # CoreFactsMemory o PermanentMemory (duck typing)
         short_term=None,
         medium_term=None,
         long_term=None,
@@ -270,14 +269,14 @@ class MemoryOrchestratorAgent:
             if not content:
                 continue
 
-            # Le directive dell'utente all'agente vanno in PermanentMemory
-            # (sono istruzioni cross-sessione inserite in testa al system prompt).
+            # Le direttive cross-sessione vanno nei fatti core (permanent_memory)
+            # e anche in Qdrant per la ricerca semantica.
             is_directive = f.get("permanent") is True or hall == "directives"
             if is_directive and self.permanent_memory:
                 try:
                     if not _already_in_permanent(self.permanent_memory, content):
-                        self.permanent_memory.add(content, mem_type="instruction")
-                        written["permanent"] += 1
+                        self.permanent_memory.add(content)
+                        written["permanent"] = written.get("permanent", 0) + 1
                 except Exception:
                     pass
 

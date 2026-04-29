@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Avvio LTSIA-py su Raspberry Pi 5 (ARM64)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Cerca virtualenv: .venv > python3 di sistema
+if [ -d "$SCRIPT_DIR/.venv" ]; then
+  PYTHON="$SCRIPT_DIR/.venv/bin/python"
+else
+  PYTHON="python3"
+fi
+
+# ctranslate2 su ARM: limita OpenMP a 1 thread per evitare conflitti
+# quando STT e altri worker girano in parallelo
+export OMP_NUM_THREADS=1
+
+exec "$PYTHON" "$SCRIPT_DIR/main.py" "$@"
