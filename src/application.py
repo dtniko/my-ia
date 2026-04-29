@@ -457,6 +457,49 @@ class Application:
         logger.flush()
         return 0
 
+    def service(self):
+        """Modalità servizio: avvia tutti i background worker senza REPL e blocca."""
+        import atexit
+        import signal
+
+        if not self._check_connectivity():
+            CLI.warning("Connettività LLM non disponibile — avvio in modalità limitata")
+
+        self._voice_port = 8765
+        voice_status = self._start_voice_background(self._voice_port)
+        if voice_status:
+            CLI.success(f"Voice server: {voice_status}")
+
+        optimizer_status = self._start_memory_optimizer_background()
+        if optimizer_status:
+            CLI.success(f"Memory optimizer: {optimizer_status}")
+        atexit.register(self._stop_memory_optimizer)
+
+        telegram_status = self._start_telegram_background()
+        if telegram_status:
+            CLI.success(f"Telegram bot: {telegram_status}")
+        atexit.register(self._stop_telegram)
+
+        CLI.success("LTSIA service avviato — in attesa (Ctrl+C per terminare)")
+
+        stop_event = __import__("threading").Event()
+
+        def _shutdown(signum, frame):
+            CLI.info("Segnale ricevuto — spegnimento in corso…")
+            stop_event.set()
+
+        signal.signal(signal.SIGTERM, _shutdown)
+        signal.signal(signal.SIGINT, _shutdown)
+
+        stop_event.wait()
+
+        vs = getattr(self, "_voice_server", None)
+        if vs is not None:
+            vs.stop()
+        self._stop_memory_optimizer()
+        self._stop_telegram()
+        CLI.info("LTSIA service terminato.")
+
     def interactive(self):
         """Modalità REPL interattiva."""
         from src.ui.interactive import Interactive

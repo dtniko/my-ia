@@ -1,0 +1,28 @@
+[Unit]
+Description=LTSIA — Local Thinking Software Intelligence Agent
+Documentation=https://github.com/your-repo/ltsia-py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/my-ia
+ExecStart=/root/my-ia/pi5_ia_service
+Restart=on-failure
+RestartSec=10
+
+# Log su file dedicato (oltre a journald)
+StandardOutput=append:/root/.ltsia/logs/service.log
+StandardError=append:/root/.ltsia/logs/service.log
+
+# Env
+Environment=PYTHONUNBUFFERED=1
+Environment=OMP_NUM_THREADS=1
+
+# Limiti risorse (RPi5 ha RAM limitata)
+MemoryMax=2G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

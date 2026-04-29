@@ -93,7 +93,9 @@ def main():
         traceback.print_exc()
         sys.exit(1)
 
-    if task:
+    if "service" in flags:
+        app.service()
+    elif task:
         # One-shot
         exit_code = app.run(task, test_command)
         sys.exit(exit_code)

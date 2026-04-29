@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Avvio LTSIA-py in modalità servizio (nessun REPL, nessun prompt interattivo).
+# Usato dal service systemd pi5_ia.service — i log vanno su stdout/stderr
+# catturati da journald o reindirizzati da StandardOutput= nel .service.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ -d "$SCRIPT_DIR/.venv" ]; then
+  PYTHON="$SCRIPT_DIR/.venv/bin/python"
+else
+  PYTHON="python3"
+fi
+
+# ctranslate2 su ARM: limita OpenMP a 1 thread
+export OMP_NUM_THREADS=1
+
+# Forza output unbuffered su stdout/stderr (importante per journald e log file)
+export PYTHONUNBUFFERED=1
+
+exec "$PYTHON" "$SCRIPT_DIR/main.py" --service "$@"
