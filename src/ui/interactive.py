@@ -223,7 +223,6 @@ class Interactive:
             print()
 
     def run(self):
-        CLI.banner()
         CLI.info(f"Work dir: {self.work_dir}")
         if self.voice_status:
             CLI.info(f"Voice:    {self.voice_status}")

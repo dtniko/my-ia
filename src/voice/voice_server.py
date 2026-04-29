@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
+import http.server
 import json
 import logging
 import os
@@ -49,6 +51,7 @@ import re
 import socket
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
 # File di timing: ~/.ltsia/logs/timing.log
@@ -91,11 +94,13 @@ class VoiceServer:
         config            : "Config",
         job_manager       : Optional["JobManager"] = None,
         snapshot_provider : Optional[Callable[[], dict]] = None,
+        qdrant_viz_backend = None,
     ):
-        self.chat_agent        = chat_agent
-        self.config            = config
-        self.job_manager       = job_manager
-        self.snapshot_provider = snapshot_provider
+        self.chat_agent          = chat_agent
+        self.config              = config
+        self.job_manager         = job_manager
+        self.snapshot_provider   = snapshot_provider
+        self._qdrant_viz_backend = qdrant_viz_backend
 
         # Stato connessione
         self._is_busy   = False
@@ -118,7 +123,7 @@ class VoiceServer:
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
-    def run(self, port: int = 8765) -> None:
+    def run(self, port: int = 8765, http_port: int = 8080) -> None:
         """Avvia il server (bloccante). Pensato per girare in un thread daemon."""
         try:
             import websockets  # noqa: F401
@@ -131,6 +136,8 @@ class VoiceServer:
         self._tts_voice = resolve_tts_voice(self.config.tts_voice)
         self._tts_rate  = getattr(self.config, "tts_rate", "+0%")
         self._port      = port
+
+        self._start_http_server(http_port, ws_port=port)
 
         # Precarica i modelli pesanti in sequenza nel thread corrente,
         # PRIMA che asyncio e ThreadPoolExecutor inizino. Questo evita che
@@ -152,6 +159,74 @@ class VoiceServer:
                 pass
             self._loop.close()
             self.ready.set()
+
+    def _start_http_server(self, http_port: int, ws_port: int = 8765) -> None:
+        """Avvia un HTTP server per servire voice/dist/ e la rotta /viz."""
+        self._http_port = None
+        dist_dir = Path(__file__).parent.parent.parent / "voice" / "dist"
+        if not dist_dir.is_dir():
+            self._http_error = f"dist non trovata ({dist_dir}) — esegui: cd voice && npm run build"
+            return
+
+        from src.tools.qdrant_viz.viz_tool import _ws_html
+
+        class _Handler(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                if self.path.split("?")[0] == "/viz":
+                    body = _ws_html(ws_port).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                super().do_GET()
+
+            def log_message(self, fmt, *args):
+                pass
+
+        handler = functools.partial(_Handler, directory=str(dist_dir))
+
+        try:
+            httpd = http.server.HTTPServer(("0.0.0.0", http_port), handler)
+        except OSError as exc:
+            self._http_error = f"porta {http_port} non disponibile: {exc}"
+            return
+
+        t = threading.Thread(target=httpd.serve_forever, daemon=True, name="voice-http")
+        t.start()
+        self._http_port = http_port
+        self._http_error = None
+
+    def print_startup_banner(self) -> None:
+        """Stampa il riepilogo di avvio. Va chiamato dal main thread dopo ready.wait()."""
+        local_ip  = getattr(self, "_startup_local_ip", "")
+        ws_port   = getattr(self, "_startup_ws_port",  self._port)
+        http_port = getattr(self, "_http_port",  None)
+        http_err  = getattr(self, "_http_error", None)
+
+        if self._verifier is not None:
+            enrolled = self._verifier.is_enrolled
+            sr_label = "attivo" if enrolled else "nessun voice print — «Daniela allena il riconoscimento vocale»"
+        else:
+            sr_label = "non disponibile"
+
+        tts_label = self._tts_voice if self._tts_voice else "non disponibile (usa TTS browser)"
+
+        print(f"[voice] ┌─ Voice server pronto ─────────────────────────────")
+        if http_port:
+            print(f"[voice] │  Frontend   http://localhost:{http_port}")
+            if local_ip:
+                print(f"[voice] │             http://{local_ip}:{http_port}  ← rete locale")
+        else:
+            print(f"[voice] │  Frontend   non disponibile — {http_err}")
+        print(f"[voice] │  WebSocket  ws://localhost:{ws_port}")
+        if local_ip:
+            print(f"[voice] │             ws://{local_ip}:{ws_port}  ← rete locale")
+        print(f"[voice] │  TTS        {tts_label}")
+        print(f"[voice] │  Speaker    {sr_label}")
+        print(f"[voice] └───────────────────────────────────────────────────")
 
     def stop(self) -> None:
         """Ferma il server asyncio dal thread principale."""
@@ -189,21 +264,9 @@ class VoiceServer:
         import websockets
 
         self._notif_queue = asyncio.Queue()
-        local_ip = _detect_local_ip()
-        print(f"[voice] WebSocket in ascolto su ws://0.0.0.0:{port}")
-        print(f"[voice]   localhost:   ws://localhost:{port}")
-        if local_ip:
-            print(f"[voice]   rete locale: ws://{local_ip}:{port}  ← usa questo dal cellulare")
-        if self._tts_voice:
-            print(f"[voice]   edge-tts attivo — voce: {self._tts_voice}")
-        else:
-            print("[voice]   edge-tts non trovato — il client userà TTS browser")
-
-        if self._verifier is not None:
-            enrolled = self._verifier.is_enrolled
-            print(f"[voice]   speaker recognition: {'attivo' if enrolled else 'nessun voice print — usa «Daniela allena il riconoscimento vocale»'}")
-        else:
-            print("[voice]   speaker recognition: non disponibile (installa resemblyzer, webrtcvad, faster-whisper)")
+        # Salva le info di startup per print_startup_banner() chiamato dal main thread
+        self._startup_local_ip = _detect_local_ip()
+        self._startup_ws_port  = port
 
         bg_tasks = []
         if self.job_manager:
@@ -227,12 +290,17 @@ class VoiceServer:
     def _init_audio_components(self) -> None:
         """Istanzia i componenti audio. I modelli vengono caricati lazily."""
         try:
-            from src.voice.speaker_verifier import SpeakerVerifier
-            from src.voice.stt_engine       import STTEngine
-            self._verifier = SpeakerVerifier()
-            model_size   = getattr(self.config, "stt_model", "small")
-            cpu_threads  = int(getattr(self.config, "stt_cpu_threads", 4))
-            self._stt    = STTEngine(model_size=model_size, language="it", cpu_threads=cpu_threads)
+            from src.voice.stt_engine import STTEngine
+            model_size  = getattr(self.config, "stt_model", "tiny")
+            cpu_threads = int(getattr(self.config, "stt_cpu_threads", 4))
+            self._stt   = STTEngine(model_size=model_size, language="it", cpu_threads=cpu_threads)
+
+            if getattr(self.config, "speaker_verify", True):
+                from src.voice.speaker_verifier import SpeakerVerifier
+                self._verifier = SpeakerVerifier()
+            else:
+                print("[voice] Speaker verification disabilitato (speaker_verify=false)")
+                self._verifier = None
         except Exception as exc:
             print(f"[voice] Audio pipeline non disponibile: {exc}")
             self._verifier = None
@@ -324,6 +392,14 @@ class VoiceServer:
                     await self._send_snapshot(websocket, loop)
                     continue
 
+                # ── Qdrant Viz ─────────────────────────────────────────────
+                if msg_type == "qdrant_fetch":
+                    await self._handle_qdrant_fetch(websocket, loop)
+                    continue
+                if msg_type == "qdrant_delete":
+                    await self._handle_qdrant_delete(websocket, loop, msg.get("id", ""))
+                    continue
+
                 # ── Messaggio testo tradizionale (fallback/debug) ──────────
                 if msg_type == "message":
                     text = msg.get("text", "").strip()
@@ -340,6 +416,30 @@ class VoiceServer:
                 self._active_ws = None
             self._pipeline  = None
             self._is_busy   = False
+
+    # ── Qdrant Viz ────────────────────────────────────────────────────────────
+
+    async def _handle_qdrant_fetch(self, websocket, loop: asyncio.AbstractEventLoop) -> None:
+        backend = self._qdrant_viz_backend
+        if backend is None:
+            await self._send(websocket, {"type": "qdrant_points", "collection": "", "points": []})
+            return
+        try:
+            result = await loop.run_in_executor(None, backend.fetch_points)
+            await self._send(websocket, {"type": "qdrant_points", **result})
+        except Exception as exc:
+            await self._send(websocket, {"type": "error", "message": f"qdrant_fetch: {exc}"})
+
+    async def _handle_qdrant_delete(self, websocket, loop: asyncio.AbstractEventLoop, pid: str) -> None:
+        backend = self._qdrant_viz_backend
+        if backend is None or not pid:
+            await self._send(websocket, {"type": "qdrant_delete_result", "ok": False})
+            return
+        try:
+            ok = await loop.run_in_executor(None, lambda: backend.delete_point(pid))
+            await self._send(websocket, {"type": "qdrant_delete_result", "ok": bool(ok)})
+        except Exception as exc:
+            await self._send(websocket, {"type": "error", "message": f"qdrant_delete: {exc}"})
 
     def _build_pipeline(self, websocket, loop: asyncio.AbstractEventLoop):
         """Crea una pipeline per la connessione corrente."""

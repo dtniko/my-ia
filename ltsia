@@ -1,28 +1,18 @@
 #!/usr/bin/env bash
-# Wrapper per avviare LTSIA-py con il virtualenv corretto
+# Wrapper per avviare LTSIA-py
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Usa .venv311 (Python 3.11 + audio pipeline) se disponibile, altrimenti .venv
+# Cerca virtualenv: .venv311 > .venv > python3 di sistema
 if [ -d "$SCRIPT_DIR/.venv311" ]; then
-  VENV="$SCRIPT_DIR/.venv311"
+  PYTHON="$SCRIPT_DIR/.venv311/bin/python"
+elif [ -d "$SCRIPT_DIR/.venv" ]; then
+  PYTHON="$SCRIPT_DIR/.venv/bin/python"
 else
-  VENV="$SCRIPT_DIR/.venv"
+  PYTHON="python3"
 fi
 
-if [ ! -d "$VENV" ]; then
-  echo "Virtualenv non trovato. Esegui prima: bash setup.sh"
-  exit 1
-fi
-
-# Fix compilazione C su macOS (clang < 14 non accetta MACOSX_DEPLOYMENT_TARGET=14)
-export MACOSX_DEPLOYMENT_TARGET=10.9
-
-# Fix OpenMP duplicato: torch e ctranslate2 portano entrambi libiomp5.dylib
-export KMP_DUPLICATE_LIB_OK=TRUE
-
-# Fix segfault: evita che OpenMP crei regioni parallele in thread worker
-# (causa crash quando PyTorch e ctranslate2 inizializzano OpenMP concorrentemente)
+# Su Linux/ARM: evita che ctranslate2 crei troppe regioni OpenMP in parallelo
+# (non necessario su macOS dove il flag era diverso)
 export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
 
-exec "$VENV/bin/python" "$SCRIPT_DIR/main.py" "$@"
+exec "$PYTHON" "$SCRIPT_DIR/main.py" "$@"

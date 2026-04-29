@@ -38,6 +38,7 @@ class QdrantMemory:
         embedder: "EmbeddingClient",
         user_id: str = "ltsia",
         dedup_threshold: float = 0.93,
+        mode: str = "server",
     ):
         self.host = host
         self.port = port
@@ -46,6 +47,7 @@ class QdrantMemory:
         self.embedder = embedder
         self.user_id = user_id
         self.dedup_threshold = dedup_threshold
+        self.mode = mode
         self._client = None
         self._ready = False
         self._init_client()
@@ -62,7 +64,14 @@ class QdrantMemory:
             return
 
         try:
-            self._client = QdrantClient(host=self.host, port=self.port, timeout=10)
+            if self.mode == "local":
+                from pathlib import Path
+                local_path = str(Path.home() / ".ltsia" / "qdrant" / "storage")
+                Path(local_path).mkdir(parents=True, exist_ok=True)
+                self._client = QdrantClient(path=local_path)
+            else:
+                self._client = QdrantClient(host=self.host, port=self.port, timeout=10)
+
             if not self._client.collection_exists(self.collection):
                 self._client.create_collection(
                     collection_name=self.collection,

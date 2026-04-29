@@ -1,31 +1,26 @@
 """
 QdrantVizTool — interfaccia web 3D per esplorare la memoria Qdrant.
 
-Avvia un server HTTP locale che proietta in 3D (PCA se numpy disponibile,
-random projection altrimenti) tutti i punti della collection e li mostra
-in un grafico Plotly con zoom, rotazione, hover sul content, click per
-vedere il dettaglio ed eliminare il punto.
+La visualizzazione è integrata nel server HTTP principale (porta 8080) alla
+rotta /viz. Le API fetch/delete passano via WebSocket invece di un server HTTP
+separato — così funziona correttamente anche da remoto.
 
 Tool: qdrant_viz
-  action='start'  → avvia il server (default porta 8090)
-  action='stop'   → ferma il server
-  action='status' → stato corrente
+  action='status' → stato corrente (il viz è sempre attivo se Qdrant è pronto)
 """
 from __future__ import annotations
-import json
 import math
 import random
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
-from urllib.parse import urlparse, parse_qs
 
 import requests
 
 from ..base_tool import BaseTool
 
 
-HTML_PAGE = r"""<!DOCTYPE html>
+def _ws_html(ws_port: int = 8765) -> str:
+    """HTML della pagina viz che usa WebSocket per fetch/delete."""
+    return r"""<!DOCTYPE html>
 <html lang="it">
 <head>
   <meta charset="utf-8">
@@ -48,6 +43,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     #info .meta { font-size: 11px; color: #7a8797; margin-top: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
     #info .actions { margin-top: 12px; display: flex; gap: 8px; }
     #status { position: fixed; top: 60px; right: 16px; padding: 8px 12px; background: rgba(18,22,28,0.95); border: 1px solid #333; border-radius: 4px; font-size: 12px; display: none; }
+    #ws-state { position: fixed; top: 10px; right: 16px; font-size: 11px; color: #7a8797; }
   </style>
 </head>
 <body>
@@ -67,10 +63,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
   <div id="status"></div>
+  <div id="ws-state">WS: connessione…</div>
 
 <script>
+const WS_PORT = """ + str(ws_port) + r""";
+const WS_URL  = `ws://${window.location.hostname}:${WS_PORT}`;
+
 let currentId = null;
 let cache = [];
+let ws = null;
+let pendingFetch = false;
+let pendingDelete = null;
 
 function flash(msg, ok = true) {
   const el = document.getElementById('status');
@@ -80,19 +83,40 @@ function flash(msg, ok = true) {
   setTimeout(() => { el.style.display = 'none'; }, 2500);
 }
 
-async function load() {
+function setWsState(label) {
+  document.getElementById('ws-state').textContent = 'WS: ' + label;
+}
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    setWsState('connesso');
+    load();
+  };
+  ws.onclose = () => {
+    setWsState('disconnesso — riconnetto…');
+    setTimeout(connect, 3000);
+  };
+  ws.onerror = () => setWsState('errore');
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === 'qdrant_points')        handlePoints(msg);
+    if (msg.type === 'qdrant_delete_result') handleDeleteResult(msg);
+  };
+}
+
+function load() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   flash('Caricamento…');
-  let data;
-  try {
-    const r = await fetch('/api/points');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    data = await r.json();
-  } catch (e) {
-    flash('Errore: ' + e.message, false);
-    return;
-  }
-  cache = data.points || [];
-  document.getElementById('coll').textContent = data.collection || '';
+  pendingFetch = true;
+  ws.send(JSON.stringify({ type: 'qdrant_fetch' }));
+}
+
+function handlePoints(msg) {
+  pendingFetch = false;
+  cache = msg.points || [];
+  document.getElementById('coll').textContent  = msg.collection || '';
   document.getElementById('count').textContent = cache.length + ' punti';
 
   const byHall = {};
@@ -119,7 +143,7 @@ async function load() {
 
   const layout = {
     paper_bgcolor: '#0b0d10',
-    plot_bgcolor: '#0b0d10',
+    plot_bgcolor:  '#0b0d10',
     font: { color: '#e6e9ef' },
     scene: {
       xaxis: { color: '#556', gridcolor: '#1e2430', backgroundcolor: '#0b0d10', showbackground: true },
@@ -132,9 +156,8 @@ async function load() {
 
   Plotly.newPlot('plot', traces, layout, { responsive: true, displaylogo: false });
 
-  const plotEl = document.getElementById('plot');
-  plotEl.on('plotly_click', (e) => {
-    const p = e.points[0];
+  document.getElementById('plot').on('plotly_click', (e) => {
+    const p  = e.points[0];
     const id = p.customdata;
     const pt = cache.find(x => x.id === id);
     if (!pt) return;
@@ -146,6 +169,19 @@ async function load() {
       'created: ' + (pt.created_at || '—');
     document.getElementById('info').style.display = 'block';
   });
+
+  flash('Caricati ' + cache.length + ' punti');
+}
+
+function handleDeleteResult(msg) {
+  if (msg.ok) {
+    flash('Punto eliminato');
+    document.getElementById('info').style.display = 'none';
+    currentId = null;
+    load();
+  } else {
+    flash('Eliminazione fallita', false);
+  }
 }
 
 document.getElementById('refresh').onclick = load;
@@ -155,22 +191,17 @@ document.getElementById('close-info').onclick = () => {
   currentId = null;
 };
 
-document.getElementById('delete-btn').onclick = async () => {
+document.getElementById('delete-btn').onclick = () => {
   if (!currentId) return;
   if (!confirm('Eliminare definitivamente questo punto?')) return;
-  try {
-    const r = await fetch('/api/points?id=' + encodeURIComponent(currentId), { method: 'DELETE' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    flash('Punto eliminato');
-    document.getElementById('info').style.display = 'none';
-    currentId = null;
-    await load();
-  } catch (e) {
-    flash('Eliminazione fallita: ' + e.message, false);
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    flash('WebSocket non connesso', false);
+    return;
   }
+  ws.send(JSON.stringify({ type: 'qdrant_delete', id: currentId }));
 };
 
-load();
+connect();
 </script>
 </body>
 </html>
@@ -178,6 +209,8 @@ load();
 
 
 class _VizBackend:
+    """Backend HTTP REST — usato con qdrant_mode=server."""
+
     def __init__(self, qdrant_url: str, collection: str):
         self.qdrant_url = qdrant_url.rstrip("/")
         self.collection = collection
@@ -197,36 +230,10 @@ class _VizBackend:
             offset = res.get("next_page_offset")
             if offset is None:
                 break
-
-        vectors: list[list[float]] = []
-        meta: list[dict] = []
-        for p in all_points:
-            v = p.get("vector")
-            if isinstance(v, dict):
-                v = next(iter(v.values()), None)
-            if not v:
-                continue
-            vectors.append(v)
-            payload = p.get("payload") or {}
-            meta.append({
-                "id": p.get("id"),
-                "content": payload.get("content", ""),
-                "wing": payload.get("wing", ""),
-                "hall": payload.get("hall", ""),
-                "room": payload.get("room", ""),
-                "created_at": payload.get("created_at", ""),
-            })
-
-        coords = _project_3d(vectors)
-        points = []
-        for m, c in zip(meta, coords):
-            m["x"], m["y"], m["z"] = c[0], c[1], c[2]
-            points.append(m)
-        return {"collection": self.collection, "points": points}
+        return _build_points_result(self.collection, all_points)
 
     def delete_point(self, pid: str) -> bool:
         url = f"{self.qdrant_url}/collections/{self.collection}/points/delete"
-        # Prova come stringa; se l'id è numerico in Qdrant, tenta cast
         payload_ids: list = [pid]
         try:
             payload_ids = [int(pid)] if pid.isdigit() else [pid]
@@ -234,6 +241,105 @@ class _VizBackend:
             pass
         r = requests.post(url, json={"points": payload_ids}, timeout=15)
         return r.ok
+
+
+class _LocalVizBackend:
+    """Backend qdrant-client embedded — riusa il client già aperto da QdrantMemory."""
+
+    def __init__(self, client, collection: str):
+        self._client = client
+        self.collection = collection
+
+    def fetch_points(self) -> dict:
+        client = self._client
+        all_points = []
+        offset = None
+        while True:
+            res = client.scroll(
+                collection_name=self.collection,
+                limit=500,
+                offset=offset,
+                with_payload=True,
+                with_vectors=True,
+            )
+            records, offset = res
+            for r in records:
+                vec = r.vector
+                if isinstance(vec, dict):
+                    vec = next(iter(vec.values()), None)
+                payload = r.payload or {}
+                all_points.append({
+                    "id": str(r.id),
+                    "vector": vec,
+                    "payload": payload,
+                })
+            if offset is None:
+                break
+        return _build_points_result(self.collection, all_points)
+
+    def delete_point(self, pid: str) -> bool:
+        from qdrant_client.models import PointIdsList
+        client = self._client
+        try:
+            point_id = int(pid) if pid.isdigit() else pid
+            client.delete(
+                collection_name=self.collection,
+                points_selector=PointIdsList(points=[point_id]),
+            )
+            return True
+        except Exception:
+            return False
+
+
+def build_backend(config, qdrant_memory=None):
+    """
+    Crea e ritorna il backend corretto (locale o server) senza avviare
+    nessun HTTP server. Usato da VoiceServer per gestire i messaggi WS.
+    Ritorna None se Qdrant non è configurato.
+    """
+    if not config:
+        return None
+    coll = getattr(config, "qdrant_collection", None)
+    if not coll:
+        return None
+    mode = getattr(config, "qdrant_mode", "server")
+    if mode == "local":
+        client = getattr(qdrant_memory, "_client", None) if qdrant_memory else None
+        if client is None:
+            return None
+        return _LocalVizBackend(client, coll)
+    else:
+        qurl = getattr(config, "qdrant_url", None)
+        if not qurl:
+            return None
+        return _VizBackend(qurl, coll)
+
+
+def _build_points_result(collection: str, raw_points: list[dict]) -> dict:
+    vectors: list[list[float]] = []
+    meta: list[dict] = []
+    for p in raw_points:
+        v = p.get("vector")
+        if isinstance(v, dict):
+            v = next(iter(v.values()), None)
+        if not v:
+            continue
+        vectors.append(v)
+        payload = p.get("payload") or {}
+        meta.append({
+            "id": p.get("id"),
+            "content": payload.get("content", ""),
+            "wing": payload.get("wing", ""),
+            "hall": payload.get("hall", ""),
+            "room": payload.get("room", ""),
+            "created_at": payload.get("created_at", ""),
+        })
+    coords = _project_3d(vectors)
+    points = []
+    for m, c in zip(meta, coords):
+        m["x"], m["y"], m["z"] = c[0], c[1], c[2]
+        points.append(m)
+    return {"collection": collection, "points": points}
 
 
 def _project_3d(vectors: list[list[float]]) -> list[list[float]]:
@@ -263,89 +369,24 @@ def _random_projection_3d(vectors: list[list[float]], seed: int = 42) -> list[li
     return out
 
 
-class _VizHandler(BaseHTTPRequestHandler):
-    server_version = "LTSIA-QdrantViz/1.0"
-
-    def log_message(self, fmt, *args):
-        pass
-
-    def _send(self, code: int, content_type: str, body: bytes):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _json(self, code: int, payload: dict):
-        self._send(code, "application/json; charset=utf-8", json.dumps(payload).encode("utf-8"))
-
-    def _html(self, code: int, html: str):
-        self._send(code, "text/html; charset=utf-8", html.encode("utf-8"))
-
-    def do_GET(self):  # noqa: N802
-        parsed = urlparse(self.path)
-        if parsed.path in ("/", "/index.html"):
-            self._html(200, HTML_PAGE)
-            return
-        if parsed.path == "/api/points":
-            try:
-                self._json(200, self.server.backend.fetch_points())
-            except Exception as e:
-                self._json(500, {"error": str(e)})
-            return
-        self._json(404, {"error": "not found"})
-
-    def do_DELETE(self):  # noqa: N802
-        parsed = urlparse(self.path)
-        if parsed.path == "/api/points":
-            qs = parse_qs(parsed.query)
-            pid = (qs.get("id") or [""])[0]
-            if not pid:
-                self._json(400, {"error": "id required"})
-                return
-            try:
-                ok = self.server.backend.delete_point(pid)
-                self._json(200 if ok else 500, {"ok": ok})
-            except Exception as e:
-                self._json(500, {"error": str(e)})
-            return
-        self._json(404, {"error": "not found"})
-
-
-class _VizServer:
-    def __init__(self, port: int, backend: _VizBackend):
-        self.port = port
-        self.backend = backend
-        self.httpd = HTTPServer(("127.0.0.1", port), _VizHandler)
-        self.httpd.backend = backend
-        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-
-    def start(self):
-        self.thread.start()
-
-    def stop(self):
-        try:
-            self.httpd.shutdown()
-            self.httpd.server_close()
-        except Exception:
-            pass
-
-
 class QdrantVizTool(BaseTool):
-    _server: Optional[_VizServer] = None
+    """
+    Tool qdrant_viz: informa l'agente che la viz è disponibile alla rotta /viz
+    del server HTTP principale. Non avvia più un server separato.
+    """
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, qdrant_memory=None):
         self.config = config
+        self.qdrant_memory = qdrant_memory
 
     def get_name(self) -> str:
         return "qdrant_viz"
 
     def get_description(self) -> str:
         return (
-            "Apre un'interfaccia web 3D dei punti in Qdrant: pallini con label del "
+            "Interfaccia web 3D dei punti in Qdrant: pallini con label del "
             "content, zoom, rotazione, eliminazione singoli punti. "
-            "action: 'start' (avvia, default port 8090), 'stop', 'status'."
+            "action: 'status' → ritorna l'URL della viz integrata nel server principale."
         )
 
     def get_parameters(self) -> dict:
@@ -354,62 +395,17 @@ class QdrantVizTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "status"],
-                    "description": "start | stop | status (default: start)",
-                },
-                "port": {
-                    "type": "integer",
-                    "description": "Porta su cui avviare il server (default 8090)",
+                    "enum": ["status"],
+                    "description": "status: ritorna URL della viz (default)",
                 },
             },
         }
 
     def execute(self, args: dict) -> str:
-        action = (args.get("action") or "start").lower()
-        if action == "stop":
-            return self._stop()
-        if action == "status":
-            return self._status()
-        port = int(args.get("port") or 8090)
-        return self._start(port)
-
-    def _start(self, port: int) -> str:
-        if QdrantVizTool._server:
-            return f"Qdrant Viz già attivo: http://127.0.0.1:{QdrantVizTool._server.port}"
-        if not self.config:
-            return "ERROR: config non disponibile — tool non può leggere qdrant_url/collection"
-        qurl = getattr(self.config, "qdrant_url", None)
-        coll = getattr(self.config, "qdrant_collection", None)
-        if not qurl or not coll:
-            return "ERROR: Qdrant non configurato (manca qdrant_url / qdrant_collection in config)"
-
-        try:
-            r = requests.get(f"{qurl}/collections/{coll}", timeout=5)
-            if not r.ok:
-                return f"ERROR: collection '{coll}' non trovata su {qurl} ({r.status_code})"
-        except Exception as e:
-            return f"ERROR: Qdrant non raggiungibile su {qurl}: {e}"
-
-        backend = _VizBackend(qurl, coll)
-        try:
-            srv = _VizServer(port, backend)
-            srv.start()
-        except OSError as e:
-            return f"ERROR: impossibile avviare server su porta {port}: {e}"
-
-        QdrantVizTool._server = srv
-        return f"Qdrant Viz avviato su http://127.0.0.1:{port} (collection '{coll}')"
-
-    def _stop(self) -> str:
-        srv = QdrantVizTool._server
-        if not srv:
-            return "Qdrant Viz non è attivo"
-        srv.stop()
-        QdrantVizTool._server = None
-        return "Qdrant Viz fermato"
-
-    def _status(self) -> str:
-        srv = QdrantVizTool._server
-        if not srv:
-            return "Qdrant Viz: non attivo"
-        return f"Qdrant Viz: attivo su http://127.0.0.1:{srv.port}"
+        coll = getattr(self.config, "qdrant_collection", None) if self.config else None
+        if not coll:
+            return "Qdrant Viz non disponibile (qdrant_collection non configurato)"
+        return (
+            f"Qdrant Viz disponibile su http://<host>:8080/viz "
+            f"(collection '{coll}') — API via WebSocket integrato"
+        )

@@ -38,6 +38,7 @@ class Config:
         tts_rate: str = "+20%",
         stt_model: str = "base",
         stt_cpu_threads: int = 4,
+        speaker_verify: bool = True,
         supermemory_api_key: str = "",
         supermemory_space_id: str = "",
         ollama_timeout: int = 1800,
@@ -46,6 +47,7 @@ class Config:
         qdrant_port: int = 6333,
         qdrant_collection: str = "ltsia_longterm",
         qdrant_vector_size: int = 768,
+        qdrant_mode: str = "server",
         memory_web_fallback_threshold: float = 0.5,
         memory_medium_ttl_days: int = 30,
         memory_short_drawers: int = 20,
@@ -89,6 +91,7 @@ class Config:
         self.tts_rate = tts_rate
         self.stt_model = stt_model
         self.stt_cpu_threads = stt_cpu_threads
+        self.speaker_verify = speaker_verify
         self.supermemory_api_key = supermemory_api_key
         self.supermemory_space_id = supermemory_space_id
         self.ollama_timeout = ollama_timeout
@@ -97,6 +100,7 @@ class Config:
         self.qdrant_port = qdrant_port
         self.qdrant_collection = qdrant_collection
         self.qdrant_vector_size = qdrant_vector_size
+        self.qdrant_mode = qdrant_mode
         self.memory_web_fallback_threshold = memory_web_fallback_threshold
         self.memory_medium_ttl_days = memory_medium_ttl_days
         self.memory_short_drawers = memory_short_drawers
@@ -215,6 +219,7 @@ class Config:
             "tts_rate": "tts_rate",
             "stt_model": "stt_model",
             "stt_cpu_threads": ("stt_cpu_threads", int),
+            "speaker_verify": ("speaker_verify", lambda v: v.lower() in ("1", "true", "yes")),
             "supermemory_api_key": "supermemory_api_key",
             "supermemory_space_id": "supermemory_space_id",
             "ollama_timeout": ("ollama_timeout", int),
@@ -223,6 +228,7 @@ class Config:
             "qdrant_port": ("qdrant_port", int),
             "qdrant_collection": "qdrant_collection",
             "qdrant_vector_size": ("qdrant_vector_size", int),
+            "qdrant_mode": "qdrant_mode",
             "memory_web_fallback_threshold": ("memory_web_fallback_threshold", float),
             "memory_medium_ttl_days": ("memory_medium_ttl_days", int),
             "memory_short_drawers": ("memory_short_drawers", int),
