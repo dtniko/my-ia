@@ -744,7 +744,9 @@ html, body, #root {
   left: 20px;
   z-index: 600;
   display: flex;
+  flex-wrap: wrap-reverse;
   gap: 6px;
+  max-width: 210px;
 }
 
 .debug-toggle {
@@ -760,6 +762,8 @@ html, body, #root {
   white-space: nowrap;
 }
 .debug-toggle:hover { color: var(--cyan); border-color: var(--cyan-dim); }
+.debug-toggle-install { color: var(--cyan); border-color: var(--cyan-dim); }
+.debug-toggle-setup   { color: #f0a040; border-color: #6b4a1a; text-decoration: none; }
 
 /* ── Debug overlay ────────────────────────────────────────────────── */
 .debug-overlay {
@@ -895,6 +899,21 @@ html, body, #root {
 .debug-warn { font-size: 11px; color: var(--yellow); background: rgba(255,208,96,0.06); padding: 6px 10px; border-radius: 6px; }
 .debug-hint { font-size: 11px; color: var(--text-dim); }
 
+/* ── Commands panel ── */
+.cmd-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.cmd-item { display: flex; align-items: baseline; gap: 10px; }
+.cmd-phrase {
+  font-family: monospace;
+  font-size: 12px;
+  color: var(--accent);
+  background: rgba(0,200,255,0.07);
+  border: 1px solid rgba(0,200,255,0.18);
+  border-radius: 4px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+.cmd-note { font-size: 10px; color: var(--text-dim); font-style: italic; }
+
 .debug-chat {
   flex: 1;
   overflow-y: auto;
@@ -946,6 +965,61 @@ html, body, #root {
 }
 .debug-send:hover { background: rgba(0,229,255,0.18); }
 .debug-send:disabled { opacity: 0.35; cursor: default; }
+
+/* ── Log panel (debug overlay) ───────────────────────────────────── */
+.log-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 16px;
+  gap: 2px;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 11px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.log-entry {
+  display: flex;
+  gap: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.log-entry:hover { background: rgba(0,229,255,0.04); }
+.log-entry-info  { color: var(--text); }
+.log-entry-log   { color: var(--text-dim); }
+.log-entry-warn  { color: var(--yellow); background: rgba(255,208,96,0.04); }
+.log-entry-error { color: var(--red);    background: rgba(255,59,92,0.06); }
+.log-ts {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding-top: 1px;
+}
+.log-msg { white-space: pre-wrap; }
+.log-empty {
+  color: var(--text-dim);
+  font-size: 12px;
+  text-align: center;
+  padding: 40px 20px;
+  font-family: inherit;
+}
+.log-tab {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  padding: 3px 10px;
+}
+.log-tab:hover     { color: var(--text); }
+.log-tab-active    { color: var(--cyan); border-color: var(--cyan-dim); }
 
 /* ── Animations ───────────────────────────────────────────────────── */
 @keyframes fade-in {

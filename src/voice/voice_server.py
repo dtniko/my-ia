@@ -76,6 +76,84 @@ if TYPE_CHECKING:
     from src.jobs.job_manager   import JobManager
 
 
+def _setup_html(host: str, app_port: int) -> str:
+    return f"""<!doctype html>
+<html lang="it">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>LTSIA — Installazione certificato</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:system-ui,sans-serif;background:#0b0c18;color:#c8d0e0;min-height:100vh;
+        display:flex;align-items:center;justify-content:center;padding:24px}}
+  .card{{background:#111827;border:1px solid #1e2d45;border-radius:16px;padding:32px;
+          max-width:480px;width:100%}}
+  h1{{font-size:1.3rem;color:#4a8fff;margin-bottom:8px}}
+  p{{font-size:.93rem;line-height:1.6;color:#8899b0;margin-bottom:20px}}
+  .step{{display:flex;gap:12px;align-items:flex-start;margin-bottom:16px}}
+  .num{{background:#4a8fff22;color:#4a8fff;border-radius:50%;width:28px;height:28px;
+         display:flex;align-items:center;justify-content:center;font-size:.8rem;
+         font-weight:700;flex-shrink:0;margin-top:2px}}
+  .step-body{{font-size:.88rem;color:#c0cce0;line-height:1.55}}
+  .step-body strong{{color:#e0e8ff}}
+  .btn{{display:block;background:#4a8fff;color:#fff;border:none;border-radius:10px;
+         padding:14px 24px;font-size:1rem;font-weight:600;cursor:pointer;
+         text-align:center;text-decoration:none;margin:24px 0 8px}}
+  .btn:hover{{background:#3a7aef}}
+  .app-link{{display:block;text-align:center;font-size:.85rem;color:#4a8fff;
+              text-decoration:none;margin-top:12px}}
+  .note{{font-size:.78rem;color:#556;margin-top:20px;padding-top:16px;
+          border-top:1px solid #1e2d45;line-height:1.5}}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>&#128274; Installa il certificato</h1>
+  <p>Per usare LTSIA su questa rete e installarla come app, il tuo dispositivo deve fidarsi
+     del certificato locale. Bastano 3 passaggi.</p>
+
+  <div class="step">
+    <div class="num">1</div>
+    <div class="step-body">
+      <strong>Scarica il certificato</strong><br>
+      Tocca il pulsante qui sotto — il file <em>ltsia-ca.pem</em> verrà salvato nei Download.
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="num">2</div>
+    <div class="step-body">
+      <strong>Installalo sul dispositivo</strong><br>
+      <strong>Android:</strong> Impostazioni → Sicurezza → Certificati → Installa → CA certificato → scegli il file.<br>
+      <strong>iPhone/iPad:</strong> apri il file scaricato → Installa profilo, poi
+        Impostazioni → Generali → Info → Impostazioni fiducia certificato → attiva LTSIA CA.<br>
+      <strong>Mac:</strong> doppio clic sul file → Accesso Portachiavi → fidati sempre.<br>
+      <strong>Windows:</strong> doppio clic → Installa → Autorità di certificazione radice attendibili.
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="num">3</div>
+    <div class="step-body">
+      <strong>Apri l'app</strong><br>
+      Dopo l'installazione vai su <strong>https://{host}:{app_port}</strong>
+      e potrai installare LTSIA come app dalla barra del browser.
+    </div>
+  </div>
+
+  <a class="btn" href="/ca.pem">&#11123; Scarica certificato</a>
+  <a class="app-link" href="https://{host}:{app_port}">Apri l'app &#8594;</a>
+
+  <div class="note">
+    Questo certificato vale solo per la tua rete locale e non viene riconosciuto da nessun
+    sito esterno. Scade il 29 luglio 2028.
+  </div>
+</div>
+</body>
+</html>"""
+
+
 def _detect_local_ip() -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -85,6 +163,33 @@ def _detect_local_ip() -> str:
         return ip if ip != "0.0.0.0" else ""
     except Exception:
         return ""
+
+
+class _WsLogHandler(logging.Handler):
+    """Invia i log WARNING+ a tutti i client WebSocket connessi."""
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self._loop:  Optional[asyncio.AbstractEventLoop] = None
+        self._queue: Optional[asyncio.Queue]             = None
+        self.setFormatter(logging.Formatter("%(name)s %(message)s"))
+
+    def attach(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue) -> None:
+        self._loop  = loop
+        self._queue = queue
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._loop is None or self._queue is None:
+            return
+        try:
+            self._loop.call_soon_threadsafe(
+                self._queue.put_nowait,
+                {"type": "log", "level": record.levelname.lower(),
+                 "msg": self.format(record), "ts": record.created},
+            )
+        except Exception:
+            pass
+
+_ws_log_handler = _WsLogHandler()
 
 
 class VoiceServer:
@@ -107,6 +212,8 @@ class VoiceServer:
         self._active_ws = None
         self._pipeline  = None
         self._notif_queue: Optional[asyncio.Queue] = None
+        self._connected_clients: set                = set()
+        self._log_queue: Optional[asyncio.Queue]    = None
 
         # Contatori per rate logging messaggi WS in entrata
         self._ws_msg_count  : int   = 0
@@ -160,15 +267,36 @@ class VoiceServer:
             self._loop.close()
             self.ready.set()
 
+    @staticmethod
+    def _load_ssl_context() -> "Optional[ssl.SSLContext]":
+        """Carica i cert da ~/.ltsia/certs/ se presenti, altrimenti None."""
+        import ssl, glob as _glob
+        certs_dir = Path(os.path.expanduser("~/.ltsia/certs"))
+        certs = sorted(_glob.glob(str(certs_dir / "*[!-key].pem")))
+        keys  = sorted(_glob.glob(str(certs_dir / "*-key.pem")))
+        if not certs or not keys:
+            return None
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(certfile=certs[0], keyfile=keys[0])
+            return ctx
+        except Exception as exc:
+            print(f"[voice] SSL: errore caricamento cert: {exc}")
+            return None
+
     def _start_http_server(self, http_port: int, ws_port: int = 8765) -> None:
-        """Avvia un HTTP server per servire voice/dist/ e la rotta /viz."""
-        self._http_port = None
+        """Avvia HTTPS su http_port e, se TLS attivo, un server HTTP plain su http_port+1 per il setup CA."""
+        self._http_port  = None
+        self._setup_port = None
         dist_dir = Path(__file__).parent.parent.parent / "voice" / "dist"
         if not dist_dir.is_dir():
             self._http_error = f"dist non trovata ({dist_dir}) — esegui: cd voice && npm run build"
             return
 
         from src.tools.qdrant_viz.viz_tool import _ws_html
+
+        ssl_ctx = self._load_ssl_context()
+        self._ssl_ctx = ssl_ctx
 
         class _Handler(http.server.SimpleHTTPRequestHandler):
             def do_GET(self):
@@ -190,6 +318,8 @@ class VoiceServer:
 
         try:
             httpd = http.server.HTTPServer(("0.0.0.0", http_port), handler)
+            if ssl_ctx:
+                httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
         except OSError as exc:
             self._http_error = f"porta {http_port} non disponibile: {exc}"
             return
@@ -198,6 +328,51 @@ class VoiceServer:
         t.start()
         self._http_port = http_port
         self._http_error = None
+
+        # Server HTTP plain per setup CA (solo se TLS attivo)
+        if ssl_ctx:
+            self._start_setup_server(http_port + 1, app_port=http_port)
+
+    def _start_setup_server(self, setup_port: int, app_port: int) -> None:
+        """HTTP server plain su setup_port — serve solo la pagina di setup e il CA cert."""
+        ca_path = Path(os.path.expanduser("~/.local/share/mkcert/rootCA.pem"))
+        if not ca_path.exists():
+            return
+
+        app_port_ = app_port
+
+        class _SetupHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                if path == "/ca.pem":
+                    data = ca_path.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-pem-file")
+                    self.send_header("Content-Disposition", "attachment; filename=ltsia-ca.pem")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                # Pagina setup per qualsiasi altro path
+                host = self.headers.get("Host", "").split(":")[0] or "192.168.1.54"
+                body = _setup_html(host, app_port_).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                pass
+
+        try:
+            httpd = http.server.HTTPServer(("0.0.0.0", setup_port), _SetupHandler)
+        except OSError:
+            return
+
+        t = threading.Thread(target=httpd.serve_forever, daemon=True, name="voice-setup")
+        t.start()
+        self._setup_port = setup_port
 
     def print_startup_banner(self) -> None:
         """Stampa il riepilogo di avvio. Va chiamato dal main thread dopo ready.wait()."""
@@ -214,16 +389,25 @@ class VoiceServer:
 
         tts_label = self._tts_voice if self._tts_voice else "non disponibile (usa TTS browser)"
 
+        ssl_ctx    = getattr(self, "_ssl_ctx",   None)
+        setup_port = getattr(self, "_setup_port", None)
+        h_scheme   = "https" if ssl_ctx else "http"
+        ws_scheme  = "wss"   if ssl_ctx else "ws"
+
         print(f"[voice] ┌─ Voice server pronto ─────────────────────────────")
         if http_port:
-            print(f"[voice] │  Frontend   http://localhost:{http_port}")
+            print(f"[voice] │  Frontend   {h_scheme}://localhost:{http_port}")
             if local_ip:
-                print(f"[voice] │             http://{local_ip}:{http_port}  ← rete locale")
+                print(f"[voice] │             {h_scheme}://{local_ip}:{http_port}  ← rete locale")
         else:
             print(f"[voice] │  Frontend   non disponibile — {http_err}")
-        print(f"[voice] │  WebSocket  ws://localhost:{ws_port}")
+        if setup_port and local_ip:
+            print(f"[voice] │  Setup CA   http://{local_ip}:{setup_port}  ← prima configurazione")
+        print(f"[voice] │  WebSocket  {ws_scheme}://localhost:{ws_port}")
         if local_ip:
-            print(f"[voice] │             ws://{local_ip}:{ws_port}  ← rete locale")
+            print(f"[voice] │             {ws_scheme}://{local_ip}:{ws_port}  ← rete locale")
+        if ssl_ctx:
+            print(f"[voice] │  TLS        attivo ✓")
         print(f"[voice] │  TTS        {tts_label}")
         print(f"[voice] │  Speaker    {sr_label}")
         print(f"[voice] └───────────────────────────────────────────────────")
@@ -260,22 +444,50 @@ class VoiceServer:
 
     # ── Server loop ───────────────────────────────────────────────────────────
 
+    def _wlog(self, level: str, msg: str) -> None:
+        """Invia un messaggio di log a tutti i client WebSocket connessi."""
+        if self._log_queue is None or self._loop is None:
+            return
+        try:
+            self._loop.call_soon_threadsafe(
+                self._log_queue.put_nowait,
+                {"type": "log", "level": level, "msg": msg, "ts": time.time()},
+            )
+        except Exception:
+            pass
+
+    async def _broadcast_logs(self) -> None:
+        while True:
+            payload = await self._log_queue.get()
+            dead = set()
+            for ws in list(self._connected_clients):
+                try:
+                    await self._send(ws, payload)
+                except Exception:
+                    dead.add(ws)
+            self._connected_clients -= dead
+
     async def _serve(self, port: int) -> None:
         import websockets
 
         self._notif_queue = asyncio.Queue()
+        self._log_queue   = asyncio.Queue()
+        _ws_log_handler.attach(self._loop, self._log_queue)
+        logging.getLogger().addHandler(_ws_log_handler)
+
         # Salva le info di startup per print_startup_banner() chiamato dal main thread
         self._startup_local_ip = _detect_local_ip()
         self._startup_ws_port  = port
 
-        bg_tasks = []
+        bg_tasks = [asyncio.create_task(self._broadcast_logs())]
         if self.job_manager:
             bg_tasks.append(asyncio.create_task(self._poll_job_notifications()))
             bg_tasks.append(asyncio.create_task(self._drain_notifications()))
             bg_tasks.append(asyncio.create_task(self._broadcast_jobs()))
 
         self._stop_event_async = asyncio.Event()
-        async with websockets.serve(self._handle_client, "0.0.0.0", port):
+        ssl_ctx = getattr(self, "_ssl_ctx", None)
+        async with websockets.serve(self._handle_client, "0.0.0.0", port, ssl=ssl_ctx):
             # Segnala al main thread che il voice server è pronto: STT caricato,
             # verifier pronto, websocket in ascolto. Da qui il REPL può stampare
             # il prompt senza rischio di sovrapposizioni.
@@ -318,6 +530,8 @@ class VoiceServer:
         self._ws_audio_count = 0
         self._ws_rate_t0     = time.monotonic()
 
+        self._connected_clients.add(websocket)
+        self._wlog("info", "[connect] Client WebSocket connesso")
         try:
             # Costruisci pipeline audio se disponibile
             if self._verifier is not None and self._stt is not None:
@@ -384,7 +598,14 @@ class VoiceServer:
                 # ── Enrollment da UI ───────────────────────────────────────
                 if msg_type == "enroll_request":
                     if pipeline is not None:
-                        await loop.run_in_executor(None, pipeline.start_enrollment)
+                        await loop.run_in_executor(
+                            None, lambda: pipeline.start_enrollment(reset=True)
+                        )
+                    else:
+                        await self._send(websocket, {
+                            "type":    "enroll_error",
+                            "message": "Riconoscimento vocale disabilitato (speaker_verify=false nella config).",
+                        })
                     continue
 
                 # ── Dashboard snapshot on-demand ───────────────────────────
@@ -410,6 +631,8 @@ class VoiceServer:
         except Exception:
             pass  # client disconnesso
         finally:
+            self._connected_clients.discard(websocket)
+            self._wlog("info", "[disconnect] Client WebSocket disconnesso")
             if pipeline:
                 pipeline.shutdown()
             if self._active_ws is websocket:
@@ -492,6 +715,7 @@ class VoiceServer:
         _dt("_run_chat avviato (loop asyncio)")
 
         self._is_busy = True
+        self._wlog("info", f"[chat] → {text[:120]}")
         # Silenzia la pipeline: l'IA sta per parlare, non vogliamo che si ascolti
         if self._pipeline:
             self._pipeline.set_deaf(True)
@@ -665,6 +889,7 @@ class VoiceServer:
 
         def on_tool_start(tool_name: str, args: dict) -> None:
             _dt(f"tool '{tool_name}' avviato")
+            self._wlog("info", f"[tool] {tool_name}")
             asyncio.run_coroutine_threadsafe(
                 self._send(websocket, {"type": "tool", "name": tool_name}),
                 loop,
@@ -709,6 +934,7 @@ class VoiceServer:
             await tts_task
 
         _dt("LLM completato, risposta intera pronta")
+        self._wlog("info", f"[chat] ← risposta {len(response)} char")
         await self._send(websocket, {"type": "done", "full": response})
         await self._send_stats(websocket)
         self._is_busy = False

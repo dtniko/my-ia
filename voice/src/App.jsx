@@ -9,7 +9,7 @@ import { QdrantPanel }  from './components/QdrantPanel.jsx'
 import { ConfigPanel }  from './components/ConfigPanel.jsx'
 import { ChatMessage, StreamingMessage } from './components/ChatMessage.jsx'
 
-const DEFAULT_WS_URL = `ws://${window.location.hostname}:8765`
+const DEFAULT_WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:8765`
 
 export default function App() {
   // ── Connection ─────────────────────────────────────────────────────────────
@@ -46,10 +46,20 @@ export default function App() {
   const [jobLogsLive, setJobLogsLive] = useState(null)
 
   // ── UI state ───────────────────────────────────────────────────────────────
+  const [showSettings,   setShowSettings]   = useState(false)
   const [showDebug,      setShowDebug]      = useState(false)
+  const [debugTab,       setDebugTab]       = useState('backend')
   const [showChat,       setShowChat]       = useState(false)
   const [chatMaximized,  setChatMaximized]  = useState(false)
   const [showConfig,     setShowConfig]     = useState(false)
+  const [showCommands,   setShowCommands]   = useState(false)
+  const [installPrompt,  setInstallPrompt]  = useState(null)
+
+  // ── Log capture ────────────────────────────────────────────────────────────
+  const MAX_LOGS = 300
+  const [frontendLogs, setFrontendLogs] = useState([])
+  const [backendLogs,  setBackendLogs]  = useState([])
+  const debugLogEndRef = useRef(null)
 
   // ── ElevenLabs ─────────────────────────────────────────────────────────────
   const [elKey,     setElKey]     = useState(() => localStorage.getItem('el_key')      ?? '')
@@ -144,6 +154,9 @@ export default function App() {
   // il reconnect-banner sopra il viso già comunica lo stato disconnesso.
   const onWsError  = useCallback(() => { setAppState('disconnected') }, [])
   const onStats    = useCallback((tokens, max, pct, compacting) => setTokenStats({ tokens, max, pct, compacting }), [])
+  const onLog      = useCallback(({ level, msg, ts }) => {
+    setBackendLogs(prev => [...prev.slice(-(MAX_LOGS - 1)), { level, msg, ts }])
+  }, []) // eslint-disable-line
 
   // Speaker recognition
   const onSpeakerStatus   = useCallback(({ state }) => {
@@ -194,7 +207,7 @@ export default function App() {
   // ── WebSocket ──────────────────────────────────────────────────────────────
   const ws = useWebSocket({
     onChunk, onDone, onTool, onStatus: onWsStatus, onError: onWsError,
-    onAudio, onNotification, onStats,
+    onAudio, onNotification, onStats, onLog,
     onSpeakerStatus, onConfirmSpeaking, onEnrollNeeded,
     onEnrollStart, onEnrollProgress, onEnrollDone, onEnrollError,
     onSpeakerResult, onSttText, onSttStatus,
@@ -287,6 +300,7 @@ export default function App() {
   }, [ws])
 
   const handleStartEnroll = useCallback(() => {
+    setShowSettings(false)
     ws.sendRaw({ type: 'enroll_request' })
   }, [ws])
 
@@ -319,6 +333,37 @@ export default function App() {
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, streamText])
   useEffect(() => { localStorage.setItem('el_key',      elKey)     }, [elKey])
   useEffect(() => { localStorage.setItem('el_voice_id', elVoiceId) }, [elVoiceId])
+
+  useEffect(() => {
+    const handler = (e) => { e.preventDefault(); setInstallPrompt(e) }
+    window.addEventListener('beforeinstallprompt', handler)
+    return () => window.removeEventListener('beforeinstallprompt', handler)
+  }, [])
+
+  // Intercetta console per log frontend
+  useEffect(() => {
+    const orig = { log: console.log, warn: console.warn, error: console.error }
+    const capture = (level) => (...args) => {
+      orig[level](...args)
+      const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')
+      setFrontendLogs(prev => [...prev.slice(-(MAX_LOGS - 1)), { level, msg, ts: Date.now() / 1000 }])
+    }
+    console.log   = capture('log')
+    console.warn  = capture('warn')
+    console.error = capture('error')
+    return () => { console.log = orig.log; console.warn = orig.warn; console.error = orig.error }
+  }, []) // eslint-disable-line
+
+  useEffect(() => {
+    if (showDebug) debugLogEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [frontendLogs, backendLogs, showDebug])
+
+  const handleInstall = useCallback(async () => {
+    if (!installPrompt) return
+    installPrompt.prompt()
+    const { outcome } = await installPrompt.userChoice
+    if (outcome === 'accepted') setInstallPrompt(null)
+  }, [installPrompt])
 
   // ── Derived: qdrant viz URL from snapshot ──────────────────────────────────
   // qdrant viz ora integrata su /viz — nessun URL esterno necessario
@@ -393,7 +438,7 @@ export default function App() {
           )}
 
           {/* Streaming text (truncated preview) */}
-          {streamText && !showDebug && (
+          {streamText && !showSettings && !showDebug && (
             <div className="stream-preview fade-in">
               {streamText.slice(-120)}
             </div>
@@ -451,15 +496,36 @@ export default function App() {
         <button className="debug-toggle" onClick={() => window.location.reload()} title="Ricarica applicazione">
           ↺ reload
         </button>
-        <button className="debug-toggle" onClick={() => { setShowChat(c => !c); setShowDebug(false); setShowConfig(false) }} title="Chat testuale">
+        <button className="debug-toggle" onClick={() => { setShowChat(c => !c); setShowSettings(false); setShowDebug(false); setShowConfig(false) }} title="Chat testuale">
           {showChat ? '✕ chat' : '💬 chat'}
         </button>
-        <button className="debug-toggle" onClick={() => { setShowConfig(c => !c); setShowDebug(false); setShowChat(false) }} title="Configurazione endpoint">
+        <button className="debug-toggle" onClick={() => { setShowConfig(c => !c); setShowSettings(false); setShowDebug(false); setShowChat(false) }} title="Configurazione endpoint">
           {showConfig ? '✕ config' : '⚙ config'}
         </button>
-        <button className="debug-toggle" onClick={() => { setShowDebug(d => !d); setShowChat(false); setShowConfig(false) }} title="Debug">
+        <button className="debug-toggle" onClick={() => { setShowSettings(s => !s); setShowDebug(false); setShowChat(false); setShowConfig(false) }} title="Impostazioni">
+          {showSettings ? '✕ settings' : '⚙ settings'}
+        </button>
+        <button className="debug-toggle" onClick={() => { setShowDebug(d => !d); setShowSettings(false); setShowChat(false); setShowConfig(false); setShowCommands(false) }} title="Log di runtime">
           {showDebug ? '✕ debug' : '🛠 debug'}
         </button>
+        <button className="debug-toggle" onClick={() => { setShowCommands(c => !c); setShowSettings(false); setShowDebug(false); setShowChat(false); setShowConfig(false) }} title="Comandi vocali">
+          {showCommands ? '✕ comandi' : '🎙 comandi'}
+        </button>
+        {installPrompt ? (
+          <button className="debug-toggle debug-toggle-install" onClick={handleInstall} title="Installa come app PWA">
+            ⬇ installa
+          </button>
+        ) : window.location.protocol !== 'https:' && (
+          <a
+            className="debug-toggle debug-toggle-setup"
+            href={`http://${window.location.hostname}:8081`}
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Prima configurazione: installa il certificato per abilitare PWA"
+          >
+            🔒 setup
+          </a>
+        )}
       </div>
 
       {/* ── Chat panel ── */}
@@ -528,12 +594,12 @@ export default function App() {
         />
       )}
 
-      {/* ── Debug overlay ── */}
-      {showDebug && (
+      {/* ── Settings overlay ── */}
+      {showSettings && (
         <div className="debug-overlay">
           <div className="debug-hdr">
-            <span className="debug-title">PANNELLO DI CONTROLLO</span>
-            <button className="debug-close" onClick={() => setShowDebug(false)}>✕</button>
+            <span className="debug-title">IMPOSTAZIONI</span>
+            <button className="debug-close" onClick={() => setShowSettings(false)}>✕</button>
           </div>
 
           <div className="debug-body">
@@ -616,44 +682,122 @@ export default function App() {
                   onChange={e => setElVoiceId(e.target.value)} />
               </label>
             </section>
+          </div>
+        </div>
+      )}
 
-            {/* Chat history */}
-            <section className="debug-section debug-section-chat">
-              <div className="debug-section-title">CRONOLOGIA CHAT</div>
-              <div className="debug-chat">
-                {messages.map(msg => (
-                  <div key={msg.id} className={`dbg-msg dbg-msg-${msg.role}`}>{msg.text}</div>
-                ))}
-                {(streamText || streamTools.length > 0) && (
-                  <div className="dbg-msg dbg-msg-assistant dbg-streaming">
-                    {streamTools.map(t => <span key={t} className="dbg-tool">[{t}]</span>)}
-                    {streamText}
-                  </div>
-                )}
-                <div ref={chatEndRef} />
-              </div>
-
-              {isConnected && (
-                <div className="debug-input-row">
-                  <textarea className="debug-input debug-textarea"
-                    placeholder="Scrivi… (Invio per inviare)"
-                    value={textInput}
-                    onChange={e => setTextInput(e.target.value)}
-                    onKeyDown={handleTextKeyDown}
-                    rows={2}
-                    disabled={appState === 'thinking'}
-                  />
-                  <button className="debug-send" onClick={handleTextSubmit}
-                    disabled={!textInput.trim() || appState === 'thinking'}>▶</button>
+      {/* ── Commands overlay ── */}
+      {showCommands && (
+        <div className="debug-overlay">
+          <div className="debug-hdr">
+            <span className="debug-title">COMANDI VOCALI</span>
+            <button className="debug-close" onClick={() => setShowCommands(false)}>✕</button>
+          </div>
+          <div className="debug-body">
+            {VOICE_COMMANDS.map(section => (
+              <section className="debug-section" key={section.title}>
+                <div className="debug-section-title">{section.title}</div>
+                <div className="cmd-list">
+                  {section.commands.map(cmd => (
+                    <div className="cmd-item" key={cmd.phrase}>
+                      <span className="cmd-phrase">«{cmd.phrase}»</span>
+                      {cmd.note && <span className="cmd-note">{cmd.note}</span>}
+                    </div>
+                  ))}
                 </div>
-              )}
-            </section>
+              </section>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Debug overlay ── */}
+      {showDebug && (
+        <div className="debug-overlay">
+          <div className="debug-hdr">
+            <span className="debug-title">DEBUG</span>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <button
+                className={`log-tab ${debugTab === 'backend' ? 'log-tab-active' : ''}`}
+                onClick={() => setDebugTab('backend')}
+              >backend</button>
+              <button
+                className={`log-tab ${debugTab === 'frontend' ? 'log-tab-active' : ''}`}
+                onClick={() => setDebugTab('frontend')}
+              >frontend</button>
+              <button className="debug-btn" style={{ padding: '3px 10px', fontSize: '10px' }}
+                onClick={() => { setBackendLogs([]); setFrontendLogs([]) }}>
+                pulisci
+              </button>
+              <button className="debug-close" onClick={() => setShowDebug(false)}>✕</button>
+            </div>
+          </div>
+
+          <div className="log-list">
+            {(debugTab === 'backend' ? backendLogs : frontendLogs).map((entry, i) => (
+              <div key={i} className={`log-entry log-entry-${entry.level}`}>
+                <span className="log-ts">{new Date(entry.ts * 1000).toLocaleTimeString('it-IT', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                <span className="log-msg">{entry.msg}</span>
+              </div>
+            ))}
+            {(debugTab === 'backend' ? backendLogs : frontendLogs).length === 0 && (
+              <div className="log-empty">Nessun log — i messaggi appariranno qui in tempo reale</div>
+            )}
+            <div ref={debugLogEndRef} />
           </div>
         </div>
       )}
     </div>
   )
 }
+
+const VOICE_COMMANDS = [
+  {
+    title: 'WAKE WORD — avvia conversazione',
+    commands: [
+      { phrase: 'Daniela …', note: 'pronuncia il suo nome per iniziare a parlarle' },
+    ],
+  },
+  {
+    title: 'PAUSA / RIPRESA',
+    commands: [
+      { phrase: 'Daniela non ascoltare', note: 'sospende il microfono' },
+      { phrase: 'Daniela non ascoltare ora' },
+      { phrase: 'Daniela parla con me', note: 'riprende l\'ascolto' },
+      { phrase: 'Daniela riprendi ad ascoltare' },
+    ],
+  },
+  {
+    title: 'ALLENAMENTO VOCE',
+    commands: [
+      { phrase: 'Daniela allena il riconoscimento vocale', note: 'avvia enrollment 40s' },
+      { phrase: 'Daniela allena riconoscimento vocale' },
+      { phrase: 'Daniela aggiorna il riconoscimento vocale', note: 'aggiorna voice print' },
+    ],
+  },
+  {
+    title: 'CONFERMA IDENTITÀ (quando chiede "sei tu?")',
+    commands: [
+      { phrase: 'Sì sono io' },
+      { phrase: 'Sono io' },
+      { phrase: 'Sto parlando con te' },
+      { phrase: 'Confermo' },
+      { phrase: 'No non sono io' },
+      { phrase: 'Non stavo parlando con te' },
+    ],
+  },
+  {
+    title: 'CHIUSURA CONVERSAZIONE',
+    commands: [
+      { phrase: 'Ok grazie', note: 'torna in standby' },
+      { phrase: 'Grazie Daniela' },
+      { phrase: 'Ho capito grazie' },
+      { phrase: 'Va bene' },
+      { phrase: 'Ciao Daniela' },
+      { phrase: 'A dopo Daniela' },
+    ],
+  },
+]
 
 const TOOL_LABELS = {
   web_search:             'RICERCA WEB',

@@ -3,6 +3,7 @@ import { useRef, useState, useCallback, useEffect } from 'react'
 export function useWebSocket ({
   onChunk, onDone, onTool, onStatus, onError,
   onAudio, onNotification, onStats,
+  onLog,                // ({level, msg, ts})   — log dal backend
   // nuovi callback audio pipeline
   onSpeakerStatus,      // ({state: "paused"|"resumed"})
   onConfirmSpeaking,    // ({transcript: "..."})
@@ -53,6 +54,7 @@ export function useWebSocket ({
           case 'notification': onNotification?.({ description: msg.description ?? '', content: msg.content ?? '', data: msg.data ?? '', format: msg.format ?? 'mp3' }); break
           case 'stats':        onStats?.(msg.tokens ?? 0, msg.max ?? 0, msg.pct ?? 0, msg.compacting ?? false);  break
           case 'error':        onError?.(msg.message ?? 'Unknown error');                                         break
+          case 'log':          onLog?.({ level: msg.level ?? 'info', msg: msg.msg ?? '', ts: msg.ts ?? 0 });     break
           // ── speaker recognition ───────────────────────────────────────────
           case 'speaker_status':   onSpeakerStatus?.({ state: msg.state ?? '' });                                    break
           case 'confirm_speaking': onConfirmSpeaking?.({ transcript: msg.transcript ?? '' });                        break
@@ -77,7 +79,7 @@ export function useWebSocket ({
     }
 
     ws.onclose = () => { wsRef.current = null; setStatus('disconnected') }
-  }, [disconnect, onChunk, onDone, onTool, onStatus, onError, onAudio, onStats,
+  }, [disconnect, onChunk, onDone, onTool, onStatus, onError, onAudio, onStats, onLog,
       onSpeakerStatus, onConfirmSpeaking, onEnrollNeeded, onEnrollStart,
       onEnrollProgress, onEnrollDone, onEnrollError,
       onSpeakerResult, onSttText, onSttStatus,
@@ -99,3 +101,4 @@ export function useWebSocket ({
 
   return { connect, disconnect, sendMessage, sendRaw, status, error }
 }
+

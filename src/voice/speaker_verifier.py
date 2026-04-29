@@ -9,12 +9,22 @@ Richiede: speechbrain==0.5.16, torch<=2.3, huggingface_hub
 from __future__ import annotations
 
 # ── Monkey-patch: speechbrain 0.5.16 usa use_auth_token rimosso da hf_hub ──
+# Intercetta anche il 404 su custom.py (non esiste nel repo spkrec-ecapa-voxceleb)
 import huggingface_hub as _hf
 _orig_hf_download = _hf.hf_hub_download
 def _hf_compat(*a, use_auth_token=None, **kw):
     if use_auth_token is not None:
         kw.setdefault("token", use_auth_token)
-    return _orig_hf_download(*a, **kw)
+    try:
+        return _orig_hf_download(*a, **kw)
+    except Exception as _e:
+        filename = a[1] if len(a) > 1 else kw.get("filename", "")
+        if "custom.py" in str(filename) and ("404" in str(_e) or "Entry Not Found" in str(_e)):
+            # speechbrain.pretrained.fetching cattura HTTPError con "404 Client Error"
+            # e lo converte in ValueError, che interfaces.py ignora per custom.py
+            from requests.exceptions import HTTPError
+            raise HTTPError("404 Client Error: custom.py not in repo") from _e
+        raise
 _hf.hf_hub_download = _hf_compat
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -109,6 +119,16 @@ class SpeakerVerifier:
             updated = (1.0 - UPDATE_WEIGHT) * self._vp + UPDATE_WEIGHT * new_emb
             updated = updated / (np.linalg.norm(updated) + 1e-9)
         self._save(updated)
+
+    def reset(self) -> None:
+        """Elimina il voice print salvato e reimposta lo stato in memoria."""
+        with self._lock:
+            self._vp = None
+        try:
+            if self._path.exists():
+                self._path.unlink()
+        except Exception:
+            pass
 
     # ── Verifica ──────────────────────────────────────────────────────────────
 

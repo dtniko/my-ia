@@ -51,8 +51,8 @@ PADDING_FRAMES     = 10            # 300 ms pre/post-speech — determina anche 
 MIN_SEG_SAMPLES    = int(SAMPLE_RATE * 0.4)   # minimo 400 ms per processare
 MIN_RMS_ENERGY     = 0.004                    # gate energetico: sotto questa soglia il segmento è scartato
 
-ENROLL_DURATION_S  = 25            # secondi di parlato per un enrollment
-MIN_ENROLL_SEGS    = 5             # segmenti minimi per l'enrollment
+ENROLL_DURATION_S  = 40            # secondi di parlato per un enrollment
+MIN_ENROLL_SEGS    = 8             # segmenti minimi per l'enrollment
 
 # Comandi vocali (normalizzati, minuscolo, senza punteggiatura)
 _CMD_PAUSE  = ["daniela non ascoltare", "daniela non ascoltare ora"]
@@ -282,8 +282,14 @@ class AudioPipeline:
             if text:
                 self._dispatch_text(text)
 
-    def start_enrollment(self) -> None:
-        """Avvia l'enrollment (chiamabile anche da UI via messaggio WebSocket)."""
+    def start_enrollment(self, reset: bool = False) -> None:
+        """Avvia l'enrollment.
+
+        reset=True cancella il voice print esistente e ricomincia da zero.
+        """
+        if reset and self._verifier is not None:
+            self._verifier.reset()
+            print("[pipeline] Voice print precedente eliminato — nuovo enrollment")
         with self._lock:
             self._state           = PipelineState.ENROLLING
             self._enroll_segs     = []

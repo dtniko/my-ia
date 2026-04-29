@@ -20,6 +20,10 @@ const WORKLET_CODE = /* js */`
 const TARGET_SR     = 16000;
 const CHUNK_SAMPLES = 3200;   // 200 ms @ 16 kHz
 
+// VAD energetico: soglia RMS e hold time per non tagliare la fine delle parole
+const VAD_RMS_THRESHOLD = 0.012;   // sotto questa soglia = silenzio
+const VAD_HOLD_CHUNKS   = 4;       // tieni attivo per N chunk dopo l'ultima voce (~800ms)
+
 class AudioProcessor extends AudioWorkletProcessor {
   constructor () {
     super();
@@ -27,6 +31,13 @@ class AudioProcessor extends AudioWorkletProcessor {
     this._accumBuf   = [];
     this._outBuf     = [];
     this._accumCount = 0.0;
+    this._holdCount  = 0;  // chunk rimanenti nel periodo di hold
+  }
+
+  _rms (chunk) {
+    let sum = 0;
+    for (let i = 0; i < chunk.length; i++) sum += chunk[i] * chunk[i];
+    return Math.sqrt(sum / chunk.length);
   }
 
   process (inputs) {
@@ -36,12 +47,8 @@ class AudioProcessor extends AudioWorkletProcessor {
     const samples = input[0];
 
     if (Math.abs(this._ratio - 1.0) < 0.001) {
-      // Già a 16 kHz — nessun resampling
-      for (let i = 0; i < samples.length; i++) {
-        this._outBuf.push(samples[i]);
-      }
+      for (let i = 0; i < samples.length; i++) this._outBuf.push(samples[i]);
     } else if (Math.abs(this._ratio - Math.round(this._ratio)) < 0.01) {
-      // Ratio intero (es. 3 per 48 kHz → 16 kHz): media di blocchi
       const factor = Math.round(this._ratio);
       for (let i = 0; i < samples.length; i++) {
         this._accumBuf.push(samples[i]);
@@ -53,7 +60,6 @@ class AudioProcessor extends AudioWorkletProcessor {
         }
       }
     } else {
-      // Ratio non intero (es. 44100 → 16000): interpolazione lineare
       for (let i = 0; i < samples.length; i++) {
         this._accumCount += 1.0;
         if (this._accumCount >= this._ratio) {
@@ -67,7 +73,15 @@ class AudioProcessor extends AudioWorkletProcessor {
 
     while (this._outBuf.length >= CHUNK_SAMPLES) {
       const chunk = new Float32Array(this._outBuf.splice(0, CHUNK_SAMPLES));
-      this.port.postMessage(chunk, [chunk.buffer]);
+      const rms   = this._rms(chunk);
+      if (rms >= VAD_RMS_THRESHOLD) {
+        this._holdCount = VAD_HOLD_CHUNKS;  // voce rilevata, ricarica hold
+      }
+      if (this._holdCount > 0) {
+        this._holdCount--;
+        this.port.postMessage(chunk, [chunk.buffer]);
+      }
+      // silenzio confermato: chunk scartato, nessun postMessage
     }
 
     return true;
